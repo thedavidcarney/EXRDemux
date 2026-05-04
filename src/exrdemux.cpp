@@ -79,6 +79,12 @@ PF_Err EffectMain(
             break;
 
         case PF_Cmd_PARAMS_SETUP:
+            // The implicit input-layer parameter is already counted in
+            // in_data->num_params. We register no additional params yet, so
+            // out_data->num_params stays at 1.
+            out_data->num_params = 1;
+            break;
+
         case PF_Cmd_RENDER:
         case PF_Cmd_ABOUT:
         default:

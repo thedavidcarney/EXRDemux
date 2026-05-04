@@ -63,6 +63,30 @@ if(WIN32)
         SUFFIX ".aex"
         PREFIX ""
     )
+
+    # ----- PiPL build pipeline (Windows) -----
+    # Apple Resource (.r) -> .rr -> PiPLtool -> .rrc -> Windows .rc
+    set(PIPL_INPUT  "${CMAKE_SOURCE_DIR}/src/exrdemux.r")
+    set(PIPL_RR     "${CMAKE_BINARY_DIR}/exrdemux.rr")
+    set(PIPL_RRC    "${CMAKE_BINARY_DIR}/exrdemux.rrc")
+    set(PIPL_RC     "${CMAKE_BINARY_DIR}/exrdemux.rc")
+    set(PIPLTOOL    "${AE_SDK_RESOURCES}/PiPLtool.exe")
+
+    if(NOT EXISTS "${PIPLTOOL}")
+        message(FATAL_ERROR "PiPLtool.exe not found at ${PIPLTOOL}")
+    endif()
+
+    # Need cmd.exe for shell redirect; CMake's command runner doesn't redirect.
+    add_custom_command(
+        OUTPUT "${PIPL_RC}"
+        DEPENDS "${PIPL_INPUT}"
+        COMMAND cmd.exe /c "cl.exe /nologo /I \"${AE_SDK_HEADERS}\" /EP \"${PIPL_INPUT}\" > \"${PIPL_RR}\""
+        COMMAND "${PIPLTOOL}" "${PIPL_RR}" "${PIPL_RRC}"
+        COMMAND cmd.exe /c "cl.exe /nologo /D MSWindows /EP \"${PIPL_RRC}\" > \"${PIPL_RC}\""
+        COMMENT "Compiling PiPL"
+    )
+
+    target_sources(EXRDemux PRIVATE "${PIPL_RC}")
 elseif(APPLE)
     target_include_directories(EXRDemux PRIVATE "${AE_SDK_HEADERS}/Mac")
     set_target_properties(EXRDemux PROPERTIES
