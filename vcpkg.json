@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "exrdemux",
+  "version": "0.1.0",
+  "description": "Scriptable multilayer EXR plugin for Adobe After Effects",
+  "homepage": "https://github.com/thedavidcarney/EXRDemux",
+  "license": "MIT",
+  "dependencies": [
+    "openexr"
+  ]
+}
