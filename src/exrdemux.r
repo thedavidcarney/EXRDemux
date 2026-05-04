@@ -62,16 +62,25 @@ resource 'PiPL' (16000) {
             0
         },
 
+        // MUST match the runtime out_flags / out_flags2 set in GlobalSetup()
+        // in exrdemux.cpp — AE rejects loading on any mismatch.
+        //   PF_OutFlag_DEEP_COLOR_AWARE   = 1 << 25 = 0x02000000
+        //   PF_OutFlag_PIX_INDEPENDENT    = 1 << 10 = 0x00000400
         AE_Effect_Global_OutFlags {
-            0x00000000
+            0x02000400
         },
 
+        //   PF_OutFlag2_FLOAT_COLOR_AWARE             = 1 << 12 = 0x00001000
+        //   PF_OutFlag2_SUPPORTS_SMART_RENDER         = 1 << 10 = 0x00000400
+        //   PF_OutFlag2_SUPPORTS_THREADED_RENDERING   = 1 << 27 = 0x08000000
         AE_Effect_Global_OutFlags_2 {
-            0x00000000
+            0x08001400
         },
 
+        // Must match the matchName in exrdemux.cpp's PF_REGISTER_EFFECT_EXT2.
+        // AE caps at 31 chars (PF_MAX_EFFECT_NAME_LEN).
         AE_Effect_Match_Name {
-            "io.github.thedavidcarney.EXRDemux"
+            "tdcarney EXRDemux"
         },
 
         AE_Reserved_Info {
