@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(EXRDemux LANGUAGES CXX VERSION 0.1.0)
+project(EXRDemux LANGUAGES C CXX VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,6 +40,7 @@ endif()
 add_library(EXRDemux MODULE
     src/exrdemux.cpp
     "${AE_SDK_UTIL}/AEGP_SuiteHandler.cpp"
+    "${AE_SDK_UTIL}/AEFX_SuiteHelper.c"
     "${AE_SDK_UTIL}/MissingSuiteError.cpp"
 )
 

@@ -64,10 +64,11 @@ resource 'PiPL' (16000) {
 
         // MUST match the runtime out_flags / out_flags2 set in GlobalSetup()
         // in exrdemux.cpp — AE rejects loading on any mismatch.
-        //   PF_OutFlag_DEEP_COLOR_AWARE   = 1 << 25 = 0x02000000
-        //   PF_OutFlag_PIX_INDEPENDENT    = 1 << 10 = 0x00000400
+        //   PF_OutFlag_DEEP_COLOR_AWARE         = 1 << 25 = 0x02000000
+        //   PF_OutFlag_PIX_INDEPENDENT          = 1 << 10 = 0x00000400
+        //   PF_OutFlag_SEND_UPDATE_PARAMS_UI    = 1 << 26 = 0x04000000
         AE_Effect_Global_OutFlags {
-            0x02000400
+            0x06000400
         },
 
         //   PF_OutFlag2_FLOAT_COLOR_AWARE             = 1 << 12 = 0x00001000
