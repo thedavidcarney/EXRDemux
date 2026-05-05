@@ -49,6 +49,8 @@
 #include "AEFX_SuiteHelper.h"
 #include "AEGP_SuiteHandler.h"
 
+#include "exrdemux_dialog.h"
+
 #include <Imath/half.h>
 #include <ImfMultiPartInputFile.h>
 #include <ImfInputPart.h>
@@ -69,6 +71,9 @@
 
 #ifdef AE_OS_WIN
     #include <Windows.h>
+#endif
+#ifdef AE_OS_MAC
+    #include <CoreFoundation/CoreFoundation.h>
 #endif
 
 #define EXRDEMUX_MAJOR_VERSION 0
@@ -108,11 +113,8 @@ enum {
     // ID 2 retired (was a single 32-bit hash, lost precision).
 };
 
-// Win32 dialog template constants (must match exrdemux_dialog.rc).
-#ifdef AE_OS_WIN
-    #define IDD_LAYER_PICKER 101
-    #define IDC_LAYER_LIST   1001
-#endif
+// (Win32 dialog template IDs now live in exrdemux_dialog_win.cpp,
+//  matching the .rc template.)
 
 // Static popup slot count. AE locks the popup's choice list at
 // PARAMS_SETUP and provides no API to mutate it later, so the visible
@@ -203,14 +205,30 @@ std::string GetSourceExrPath(PF_InData* in_data, std::string* diag_out) {
     std::string result;
     if (utf16) {
 #ifdef AE_OS_WIN
+        // A_UTF16Char is 16-bit, matches wchar_t on Windows.
         const wchar_t* wide = reinterpret_cast<const wchar_t*>(utf16);
         int n = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
         if (n > 1) {
             result.resize(n - 1);
             WideCharToMultiByte(CP_UTF8, 0, wide, -1, &result[0], n, nullptr, nullptr);
         }
-#else
-        (void)utf16;  // TODO(mac)
+#elif defined(AE_OS_MAC)
+        // A_UTF16Char is 16-bit unsigned, matches UniChar (NOT wchar_t,
+        // which is 32-bit on Mac). Build a CFString and convert to UTF-8.
+        size_t len = 0;
+        while (utf16[len] != 0) ++len;
+        CFStringRef cfstr = CFStringCreateWithCharacters(
+            nullptr, reinterpret_cast<const UniChar*>(utf16),
+            static_cast<CFIndex>(len));
+        if (cfstr) {
+            CFIndex utf8_max = CFStringGetMaximumSizeForEncoding(
+                CFStringGetLength(cfstr), kCFStringEncodingUTF8) + 1;
+            std::vector<char> buf(static_cast<size_t>(utf8_max), 0);
+            if (CFStringGetCString(cfstr, buf.data(), utf8_max, kCFStringEncodingUTF8)) {
+                result = buf.data();
+            }
+            CFRelease(cfstr);
+        }
 #endif
     }
 
@@ -747,111 +765,43 @@ PF_Err RenderViaChannelSuite(PF_InData* in_data, PF_OutData* out_data,
     return PF_Err_NONE;
 }
 
+// Path to the user's Desktop, where we drop the diagnostic perf log.
+// Empty string if unavailable. Used only for development debugging.
+std::string DesktopFilePath(const char* filename) {
+#ifdef AE_OS_WIN
+    if (const char* home = std::getenv("USERPROFILE")) {
+        return std::string(home) + "\\Desktop\\" + filename;
+    }
+#elif defined(AE_OS_MAC)
+    if (const char* home = std::getenv("HOME")) {
+        return std::string(home) + "/Desktop/" + filename;
+    }
+#endif
+    return std::string();
+}
+
 // Append a single perf line to the desktop log. Cheap if file ops are
 // fast (and they are; debug log opens cache nicely).
 void LogPerf(const char* selector, long long total_us,
              const RenderTimings& t, const std::string& path,
              const std::string& layer) {
-#ifdef AE_OS_WIN
-    if (const char* home = std::getenv("USERPROFILE")) {
-        std::string log_path = std::string(home) + "\\Desktop\\exrdemux_perf.txt";
-        if (FILE* f = std::fopen(log_path.c_str(), "ab")) {
-            std::fprintf(f,
-                "%s total=%lldus open=%lldus read=%lldus convert=%lldus  layer=%s  path=%s\n",
-                selector, total_us, t.open_us, t.read_us, t.convert_us,
-                layer.empty() ? "<none>" : layer.c_str(),
-                path.empty() ? "<none>" : path.c_str());
-            std::fclose(f);
-        }
+    std::string log_path = DesktopFilePath("exrdemux_perf.txt");
+    if (log_path.empty()) return;
+    if (FILE* f = std::fopen(log_path.c_str(), "ab")) {
+        std::fprintf(f,
+            "%s total=%lldus open=%lldus read=%lldus convert=%lldus  layer=%s  path=%s\n",
+            selector, total_us, t.open_us, t.read_us, t.convert_us,
+            layer.empty() ? "<none>" : layer.c_str(),
+            path.empty() ? "<none>" : path.c_str());
+        std::fclose(f);
     }
-#endif
 }
 
-// ===== Modal "Pick Layer" dialog (Windows) ======================
-//
-// Shows a centered modal listbox of all layer names. Returns the picked
-// 0-based index, or -1 if cancelled. Win32-specific for now; Mac path
-// will use NSPanel/NSAlert later.
-
-#ifdef AE_OS_WIN
-
-struct LayerDialogContext {
-    const std::vector<std::string>* layers;
-    int                              result;  // out
-};
-
-INT_PTR CALLBACK LayerPickerDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    static LayerDialogContext* ctx = nullptr;
-
-    switch (msg) {
-        case WM_INITDIALOG: {
-            ctx = reinterpret_cast<LayerDialogContext*>(lp);
-            HWND lb = GetDlgItem(hwnd, IDC_LAYER_LIST);
-            for (const auto& name : *ctx->layers) {
-                SendMessageA(lb, LB_ADDSTRING, 0,
-                             reinterpret_cast<LPARAM>(name.c_str()));
-            }
-            SendMessage(lb, LB_SETCURSEL, 0, 0);
-            return TRUE;
-        }
-        case WM_COMMAND: {
-            int id   = LOWORD(wp);
-            int code = HIWORD(wp);
-            if (id == IDOK || (id == IDC_LAYER_LIST && code == LBN_DBLCLK)) {
-                HWND lb = GetDlgItem(hwnd, IDC_LAYER_LIST);
-                LRESULT sel = SendMessage(lb, LB_GETCURSEL, 0, 0);
-                if (sel != LB_ERR && ctx) ctx->result = static_cast<int>(sel);
-                EndDialog(hwnd, IDOK);
-                return TRUE;
-            }
-            if (id == IDCANCEL) {
-                if (ctx) ctx->result = -1;
-                EndDialog(hwnd, IDCANCEL);
-                return TRUE;
-            }
-            break;
-        }
-        case WM_CLOSE:
-            if (ctx) ctx->result = -1;
-            EndDialog(hwnd, IDCANCEL);
-            return TRUE;
-    }
-    return FALSE;
-}
-
-int ShowLayerPickerDialog(const std::vector<std::string>& layers) {
-    if (layers.empty()) return -1;
-
-    // Find the module that contains our dialog resource (this DLL).
-    HMODULE module = nullptr;
-    GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&ShowLayerPickerDialog),
-        &module);
-
-    LayerDialogContext ctx;
-    ctx.layers = &layers;
-    ctx.result = -1;
-
-    INT_PTR rc = DialogBoxParamA(
-        module,
-        MAKEINTRESOURCEA(IDD_LAYER_PICKER),
-        GetActiveWindow(),
-        LayerPickerDlgProc,
-        reinterpret_cast<LPARAM>(&ctx));
-
-    if (rc == -1) return -1;  // dialog creation failed
-    return ctx.result;
-}
-
-#else  // AE_OS_WIN
-
-int ShowLayerPickerDialog(const std::vector<std::string>& /*layers*/) {
-    return -1;  // TODO(mac)
-}
-
-#endif
+// (Layer picker dialog implementation lives in:
+//    src/exrdemux_dialog_win.cpp  (Win32, backed by exrdemux_dialog.rc)
+//    src/exrdemux_dialog_mac.mm   (AppKit NSAlert + NSPopUpButton)
+//  Both expose the same `int ShowLayerPickerDialog(...)` from
+//  exrdemux_dialog.h.)
 
 PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data,
                    PF_ParamDef* /*params*/[], PF_LayerDef* /*output*/) {

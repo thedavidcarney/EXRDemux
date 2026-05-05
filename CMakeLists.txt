@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.25)
-project(EXRDemux LANGUAGES C CXX VERSION 0.1.0)
+
+# Enable Objective-C++ when building on macOS so .mm files compile.
+if(APPLE)
+    project(EXRDemux LANGUAGES C CXX OBJC OBJCXX VERSION 0.1.0)
+else()
+    project(EXRDemux LANGUAGES C CXX VERSION 0.1.0)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,6 +13,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Match vcpkg's runtime: dynamic CRT (/MD or /MDd).
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
+# macOS deployment target — keep modest so we don't gratuitously block
+# older Macs. AE 2025 itself drops support for older OSes anyway.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15"
+        CACHE STRING "Minimum macOS version" FORCE)
+endif()
 
 # ----- Dependencies -----
 find_package(OpenEXR CONFIG REQUIRED)
@@ -89,14 +102,77 @@ if(WIN32)
 
     target_sources(EXRDemux PRIVATE "${PIPL_RC}")
 
-    # Dialog resource (Pick Layer modal). Hand-authored .rc compiled by RC.
-    target_sources(EXRDemux PRIVATE "${CMAKE_SOURCE_DIR}/src/exrdemux_dialog.rc")
+    # Win-side dialog: hand-authored Win32 dialog template + impl.
+    target_sources(EXRDemux PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/exrdemux_dialog.rc"
+        "${CMAKE_SOURCE_DIR}/src/exrdemux_dialog_win.cpp"
+    )
+
 elseif(APPLE)
     target_include_directories(EXRDemux PRIVATE "${AE_SDK_HEADERS}/Mac")
-    set_target_properties(EXRDemux PROPERTIES
-        BUNDLE TRUE
-        BUNDLE_EXTENSION "plugin"
+    target_compile_definitions(EXRDemux PRIVATE macintosh)
+
+    # Mac-side dialog: AppKit modal in an Objective-C++ source file.
+    target_sources(EXRDemux PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/exrdemux_dialog_mac.mm"
     )
+
+    # Build a proper .plugin bundle (not a bare .dylib). AE looks for
+    # CFBundlePackageType = "eFKT" inside the bundle's Info.plist.
+    set_target_properties(EXRDemux PROPERTIES
+        BUNDLE                    TRUE
+        BUNDLE_EXTENSION          "plugin"
+        OUTPUT_NAME               "EXRDemux"
+        MACOSX_BUNDLE_INFO_PLIST  "${CMAKE_SOURCE_DIR}/cmake/MacInfoPlist.in"
+        MACOSX_BUNDLE_BUNDLE_NAME            "EXRDemux"
+        MACOSX_BUNDLE_GUI_IDENTIFIER         "io.github.thedavidcarney.EXRDemux"
+        MACOSX_BUNDLE_BUNDLE_VERSION         "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING   "${PROJECT_VERSION}"
+    )
+
+    # Frameworks: AppKit (Cocoa) for the dialog, CoreFoundation for the
+    # A_UTF16Char path conversion in GetSourceExrPath().
+    target_link_libraries(EXRDemux PRIVATE
+        "-framework Cocoa"
+        "-framework CoreFoundation"
+    )
+
+    # ----- PiPL build pipeline (macOS) -----
+    # Same source .r file as Windows; compiled by Apple's Rez to a
+    # .rsrc that ends up at Contents/Resources/EXRDemux.rsrc inside
+    # the bundle.
+    set(PIPL_INPUT "${CMAKE_SOURCE_DIR}/src/exrdemux.r")
+    set(PIPL_RSRC  "${CMAKE_BINARY_DIR}/EXRDemux.rsrc")
+
+    find_program(REZ_EXECUTABLE
+        NAMES Rez
+        PATHS /usr/bin /Applications/Xcode.app/Contents/Developer/usr/bin
+        DOC "Apple Rez resource compiler (ships with Xcode CLT)")
+    if(NOT REZ_EXECUTABLE)
+        message(FATAL_ERROR
+            "Rez not found. Install Xcode Command Line Tools (xcode-select --install).")
+    endif()
+
+    # Rez doesn't auto-define AE_OS_MAC, so pass it explicitly. The
+    # SDK's AE_General.r is the macOS-side Resource header with type
+    # definitions; -i adds the include path.
+    add_custom_command(
+        OUTPUT "${PIPL_RSRC}"
+        DEPENDS "${PIPL_INPUT}"
+        COMMAND "${REZ_EXECUTABLE}"
+                -d "AE_OS_MAC"
+                -d "ARCH_64"
+                -i "${AE_SDK_HEADERS}"
+                -i "${AE_SDK_RESOURCES}"
+                -o "${PIPL_RSRC}"
+                "${PIPL_INPUT}"
+        COMMENT "Compiling PiPL via Rez"
+        VERBATIM)
+
+    set_source_files_properties("${PIPL_RSRC}" PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources"
+        GENERATED TRUE)
+    target_sources(EXRDemux PRIVATE "${PIPL_RSRC}")
 endif()
 
 # Quiet a few MSVC warnings the SDK headers trip but we can't fix.
