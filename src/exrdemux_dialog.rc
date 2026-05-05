@@ -1,0 +1,19 @@
+// Windows dialog template for the "Pick Layer" modal.
+// Compiled by MSVC's resource compiler and embedded into EXRDemux.aex.
+
+#include <windows.h>
+
+#define IDD_LAYER_PICKER   101
+#define IDC_LAYER_LIST     1001
+
+IDD_LAYER_PICKER DIALOGEX 0, 0, 240, 320
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_DLGMODALFRAME
+CAPTION "Pick EXR Layer"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LISTBOX         IDC_LAYER_LIST,  7,  7, 226, 285,
+                    LBS_NOTIFY | LBS_USETABSTOPS | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "OK",            IDOK,           126, 298,  50, 14
+    PUSHBUTTON      "Cancel",        IDCANCEL,       183, 298,  50, 14
+END

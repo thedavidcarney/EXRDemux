@@ -87,6 +87,9 @@ if(WIN32)
     )
 
     target_sources(EXRDemux PRIVATE "${PIPL_RC}")
+
+    # Dialog resource (Pick Layer modal). Hand-authored .rc compiled by RC.
+    target_sources(EXRDemux PRIVATE "${CMAKE_SOURCE_DIR}/src/exrdemux_dialog.rc")
 elseif(APPLE)
     target_include_directories(EXRDemux PRIVATE "${AE_SDK_HEADERS}/Mac")
     set_target_properties(EXRDemux PROPERTIES
