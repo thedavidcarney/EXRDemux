@@ -50,6 +50,8 @@
 #include <ImfMultiPartInputFile.h>
 #include <ImfChannelList.h>
 
+#include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <set>
@@ -70,7 +72,8 @@ enum {
     PARAM_INPUT = 0,
     PARAM_LAYER,
     PARAM_PICK_BUTTON,
-    PARAM_HASH,
+    PARAM_HASH_HI,
+    PARAM_HASH_LO,
     PARAM_BLACK,
     PARAM_WHITE,
     PARAM_UNMULT,
@@ -79,13 +82,19 @@ enum {
 
 // Param IDs (must be unique and stable across plugin versions for
 // project file compatibility). Adding new params must use a fresh ID.
+//
+// The hash is split into two 16-bit halves because PF_Param_FLOAT_SLIDER
+// round-trips through 32-bit float somewhere in AE's persistence path,
+// and integers above ~16M lose precision. 16-bit halves stay exact.
 enum {
     ID_LAYER       = 1,
-    ID_HASH        = 2,
     ID_BLACK       = 3,
     ID_WHITE       = 4,
     ID_UNMULT      = 5,
-    ID_PICK_BUTTON = 6
+    ID_PICK_BUTTON = 6,
+    ID_HASH_HI     = 7,
+    ID_HASH_LO     = 8
+    // ID 2 retired (was a single 32-bit hash, lost precision).
 };
 
 // Win32 dialog template constants (must match exrdemux_dialog.rc).
@@ -101,26 +110,41 @@ enum {
 // backing store.
 constexpr int kLayerSlotCount = 256;
 
-// Build the pipe-separated label list once at process startup. 256 slots,
-// labels "Layer 1" .. "Layer 256". Static lifetime so safe to hand to AE.
+// Build the pipe-separated label list once. 256 slots, "Layer 1".."Layer 256".
+// C++11 magic-static init is thread-safe; the buffer's lifetime is the
+// process so the pointer we hand AE stays valid forever.
 const char* StaticSlotLabels() {
-    static char buf[256 * 16];
-    static bool built = false;
-    if (!built) {
-        char* p = buf;
+    static const std::string buf = []{
+        std::string s;
+        s.reserve(kLayerSlotCount * 12);
         for (int i = 1; i <= kLayerSlotCount; ++i) {
-            int n = std::snprintf(p, sizeof(buf) - (p - buf),
-                                  "%sLayer %d", i == 1 ? "" : "|", i);
-            p += n;
+            if (i > 1) s += '|';
+            s += "Layer ";
+            s += std::to_string(i);
         }
-        built = true;
-    }
-    return buf;
+        return s;
+    }();
+    return buf.c_str();
 }
 
 void link_check_openexr() {
     Imath::half h(1.0f);
     (void)h;
+}
+
+// FNV-1a 32-bit hash. Used to persist channel-name selection in a
+// scriptable numeric param so the choice survives re-renders that shift
+// the EXR's channel ordering (the original user-pain motivating this
+// project). Must match the JS implementation in
+// tests/jsx/exrdemux_helpers.jsx so JSX automation can compute the
+// same hash without going through the dialog.
+uint32_t HashLayerName(const std::string& s) {
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
 }
 
 // Get the file path of the EXR backing the layer this effect is applied to.
@@ -343,12 +367,13 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data,
     PF_Err     err = PF_Err_NONE;
     PF_ParamDef def;
 
-    // [1] Layer popup. Static slot labels — see header comment for why we
-    // can't show real layer names directly. Resolution from slot to actual
-    // channel happens at render time. The Pick Layer button (next param)
-    // is the user-friendly way to choose; this popup is the scriptable
-    // backing.
+    // [1] Layer popup. Hidden from the Effect Controls panel — its only
+    // job is to be the JSX-scriptable backing store for the slot index.
+    // (AE's popup string list is locked at PARAMS_SETUP and can't be
+    // updated to real layer names; we surface real names via the button
+    // below + dynamic display-name updates.)
     AEFX_CLR_STRUCT(def);
+    def.ui_flags = PF_PUI_INVISIBLE;
     PF_ADD_POPUP("Layer",
                  kLayerSlotCount,
                  1,                       // 1-based default
@@ -357,29 +382,38 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data,
 
     // [2] Pick Layer button — opens a native modal listbox of real names.
     // SUPERVISE flag tells AE to send PF_Cmd_USER_CHANGED_PARAM on click.
+    // The param's display name (left of the button) is updated dynamically
+    // to "Layer: <selected layer>" after each pick.
     AEFX_CLR_STRUCT(def);
     def.param_type = PF_Param_BUTTON;
     def.flags      = PF_ParamFlag_SUPERVISE;
     PF_STRNNCPY(def.PF_DEF_NAME, "Layer", sizeof(def.PF_DEF_NAME));
-    def.u.button_d.u.PF_DEF_NAMESPTR = "Pick Layer...";  // ASCII only
+    def.u.button_d.u.PF_DEF_NAMESPTR = "Pick Layer...";
     def.uu.id = ID_PICK_BUTTON;
     if (PF_Err pe = PF_ADD_PARAM(in_data, -1, &def)) return pe;
 
-    // [2] Hidden 32-bit hash of the selected channel's name. This is the
-    // *real* persistence — the popup index is just for UI navigation.
-    // INVISIBLE so the user never sees it; CANNOT_TIME_VARY so AE doesn't
-    // try to keyframe it.
+    // [3,4] Layer-name hash split into hi/lo 16-bit halves. Stored as two
+    // float sliders so they survive AE's float32 persistence quantization
+    // (a single 32-bit hash slider rounds to the nearest representable
+    // float and corrupts integer hashes above ~16M). Hidden from UI;
+    // populated on Pick Layer click and read at render time.
     AEFX_CLR_STRUCT(def);
     def.flags    = PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP;
     def.ui_flags = PF_PUI_INVISIBLE;
-    PF_ADD_FLOAT_SLIDERX("Layer Hash",
-                         -1e10, 1e10,        // valid range
-                         -1e10, 1e10,        // slider range (irrelevant; hidden)
-                         0.0,                // default: 0 = unset
-                         4,                  // precision
+    PF_ADD_FLOAT_SLIDERX("Layer Hash Hi",
+                         0, 65535, 0, 65535, 0.0, 0,
                          PF_ValueDisplayFlag_NONE,
                          PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP,
-                         ID_HASH);
+                         ID_HASH_HI);
+
+    AEFX_CLR_STRUCT(def);
+    def.flags    = PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP;
+    def.ui_flags = PF_PUI_INVISIBLE;
+    PF_ADD_FLOAT_SLIDERX("Layer Hash Lo",
+                         0, 65535, 0, 65535, 0.0, 0,
+                         PF_ValueDisplayFlag_NONE,
+                         PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP,
+                         ID_HASH_LO);
 
     // [3] Black Point — same intent as EXtractoR's Black Point.
     AEFX_CLR_STRUCT(def);
@@ -445,23 +479,41 @@ PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* /*out_data*/,
     }
 
     const std::string& name = layers[picked];
+    uint32_t hash = HashLayerName(name);
 
-    // Empirically attempt to push the new state back to the project:
-    //   - update the popup's stored value (1-based index)
-    //   - update the popup's display label so the user sees the name
+    // Persist:
+    //   - PARAM_HASH_HI / PARAM_HASH_LO (FNV-1a 32-bit name hash, split
+    //     across two float sliders to survive AE's float32 persistence)
+    //   - PARAM_LAYER (1-based popup index, scriptable convenience)
     if (params && params[PARAM_LAYER]) {
         params[PARAM_LAYER]->u.pd.value = static_cast<short>(picked + 1);
         params[PARAM_LAYER]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
     }
+    if (params && params[PARAM_HASH_HI]) {
+        params[PARAM_HASH_HI]->u.fs_d.value =
+            static_cast<double>((hash >> 16) & 0xFFFFu);
+        params[PARAM_HASH_HI]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+    }
+    if (params && params[PARAM_HASH_LO]) {
+        params[PARAM_HASH_LO]->u.fs_d.value =
+            static_cast<double>(hash & 0xFFFFu);
+        params[PARAM_HASH_LO]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+    }
 
+    // Update the button's left-side display name to "Layer: <selected>"
+    // so the user can see the current selection at a glance without
+    // re-opening the dialog. The button's face text ("Pick Layer...")
+    // must be preserved explicitly — AEFX_CLR_STRUCT zeroes the union
+    // and AE reads the (now-null) namesptr otherwise, blanking the button.
     AEGP_SuiteHandler suites(in_data->pica_basicP);
     PF_ParamDef def;
     AEFX_CLR_STRUCT(def);
-    def.param_type = PF_Param_POPUP;
+    def.param_type = PF_Param_BUTTON;
+    def.u.button_d.u.PF_DEF_NAMESPTR = "Pick Layer...";
     std::string new_name = "Layer: " + name;
     PF_STRNNCPY(def.PF_DEF_NAME, new_name.c_str(), sizeof(def.PF_DEF_NAME));
     suites.ParamUtilsSuite3()->PF_UpdateParamUI(
-        in_data->effect_ref, PARAM_LAYER, &def);
+        in_data->effect_ref, PARAM_PICK_BUTTON, &def);
 
     return PF_Err_NONE;
 }
