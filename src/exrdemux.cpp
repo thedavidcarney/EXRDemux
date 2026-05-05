@@ -269,7 +269,98 @@ std::vector<std::string> EnumerateExrLayers(
     return layers;
 }
 
-// ===== EXR rendering ============================================
+// ===== AE channel-suite layer source =============================
+//
+// AE's bundled importer decodes the multilayer EXR once into RAM and
+// exposes every channel via PF_ChannelSuite. We use it as the source
+// of truth for what layers exist + how to read their pixels — this
+// avoids re-decoding the file on every render and is the same API
+// EXtractoR uses (which is why it's so much faster).
+
+// Channel-name suffixes that mark a "this is the whole-layer 4-channel
+// ARGB chunk" entry. AE's importer sometimes uses uppercase, sometimes
+// lowercase (cryptos use lowercase).
+bool EndsWithArgbSuffix(const std::string& name) {
+    static const char* kSuffixes[] = {".ARGB", ".argb"};
+    for (const char* s : kSuffixes) {
+        size_t slen = std::strlen(s);
+        if (name.size() >= slen &&
+            name.compare(name.size() - slen, slen, s) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Strip the .ARGB/.argb suffix and de-duplicate a doubled prefix of the
+// form "X.X" -> "X". Examples:
+//   "Top Light Down.ARGB"                          -> "Top Light Down"
+//   "CurtainColumn_001.CurtainColumn_001.ARGB"     -> "CurtainColumn_001"
+//   "Image.Image.argb"                             -> "Image"
+std::string DisplayNameFromArgbChannel(const std::string& ae_name) {
+    size_t last_dot = ae_name.find_last_of('.');
+    if (last_dot == std::string::npos) return ae_name;
+    std::string prefix = ae_name.substr(0, last_dot);
+
+    size_t mid_dot = prefix.find_last_of('.');
+    if (mid_dot != std::string::npos) {
+        std::string left  = prefix.substr(0, mid_dot);
+        std::string right = prefix.substr(mid_dot + 1);
+        if (left == right) return left;
+    }
+    return prefix;
+}
+
+struct ChannelEntry {
+    std::string    display_name;
+    PF_ChannelRef  ref;
+    PF_ChannelDesc desc;
+};
+
+// Enumerate the input layer's ARGB-chunk channels. Each entry's
+// display_name is what we hash + show to the user; ref is the handle
+// AE wants for PF_CheckoutLayerChannel.
+std::vector<ChannelEntry> EnumerateChannelSuiteLayers(
+    PF_InData* in_data, PF_OutData* out_data)
+{
+    std::vector<ChannelEntry> entries;
+    if (!in_data || !out_data) return entries;
+
+    PF_ChannelSuite1* cs = nullptr;
+    if (AEFX_AcquireSuite(in_data, out_data, kPFChannelSuite1,
+                          kPFChannelSuiteVersion1, "channel suite",
+                          reinterpret_cast<void**>(&cs)) != PF_Err_NONE || !cs) {
+        return entries;
+    }
+
+    A_long count = 0;
+    cs->PF_GetLayerChannelCount(in_data->effect_ref, PARAM_INPUT, &count);
+
+    entries.reserve(static_cast<size_t>(count));
+    for (A_long i = 0; i < count; ++i) {
+        PF_Boolean     found = FALSE;
+        ChannelEntry   e;
+        std::memset(&e.ref,  0, sizeof(e.ref));
+        std::memset(&e.desc, 0, sizeof(e.desc));
+        if (cs->PF_GetLayerChannelIndexedRefAndDesc(
+                in_data->effect_ref, PARAM_INPUT,
+                static_cast<PF_ChannelIndex>(i),
+                &found, &e.ref, &e.desc) != PF_Err_NONE || !found) {
+            continue;
+        }
+        if (e.desc.dimension != 4) continue;          // skip per-channel scalars
+        if (!EndsWithArgbSuffix(e.desc.name)) continue;
+
+        e.display_name = DisplayNameFromArgbChannel(e.desc.name);
+        entries.push_back(e);
+    }
+
+    AEFX_ReleaseSuite(in_data, out_data, kPFChannelSuite1,
+                      kPFChannelSuiteVersion1, "channel suite");
+    return entries;
+}
+
+// ===== EXR rendering (channel-suite path) =========================
 
 // Where in the EXR each of the layer's R/G/B/A channels lives. For
 // multipart files all four typically share one part.
@@ -538,6 +629,124 @@ PF_Err RenderExrLayer(const std::string& path,
     }
 }
 
+// Read the chosen layer's ARGB chunk via PF_ChannelSuite (data already
+// decoded by AE's importer — no file read), apply Black/White Point +
+// UnMult, write to the output world in its native pixel format.
+PF_Err RenderViaChannelSuite(PF_InData* in_data, PF_OutData* out_data,
+                              uint32_t hash, double black, double white, bool unmult,
+                              PF_EffectWorld* output, PF_PixelFormat fmt,
+                              RenderTimings* timings = nullptr) {
+    if (!output || !output->data) return PF_Err_NONE;
+    if (timings) *timings = RenderTimings{};
+
+    using clock = std::chrono::high_resolution_clock;
+    auto t_start = clock::now();
+
+    // Find the channel matching our stored hash.
+    std::vector<ChannelEntry> entries = EnumerateChannelSuiteLayers(in_data, out_data);
+    const ChannelEntry* picked = nullptr;
+    for (const auto& e : entries) {
+        if (HashLayerName(e.display_name) == hash) { picked = &e; break; }
+    }
+    if (!picked) { FillBlack(output, fmt); return PF_Err_NONE; }
+    auto t_resolved = clock::now();
+
+    // Acquire the channel suite for the actual checkout.
+    PF_ChannelSuite1* cs = nullptr;
+    if (AEFX_AcquireSuite(in_data, out_data, kPFChannelSuite1,
+                          kPFChannelSuiteVersion1, "channel suite",
+                          reinterpret_cast<void**>(&cs)) != PF_Err_NONE || !cs) {
+        FillBlack(output, fmt);
+        return PF_Err_NONE;
+    }
+
+    PF_ChannelChunk chunk;
+    std::memset(&chunk, 0, sizeof(chunk));
+    PF_ChannelRef ref = picked->ref;  // suite mutates it; pass our copy
+    PF_Err checkout_err = cs->PF_CheckoutLayerChannel(
+        in_data->effect_ref, &ref,
+        in_data->current_time, in_data->time_step, in_data->time_scale,
+        PF_DataType_FLOAT, &chunk);
+
+    auto t_opened = clock::now();
+
+    if (checkout_err != PF_Err_NONE || !chunk.dataPV ||
+        chunk.dimensionL != 4 || chunk.data_type != PF_DataType_FLOAT) {
+        AEFX_ReleaseSuite(in_data, out_data, kPFChannelSuite1,
+                          kPFChannelSuiteVersion1, "channel suite");
+        FillBlack(output, fmt);
+        return PF_Err_NONE;
+    }
+
+    // The chunk is interleaved ARGB float (4 floats per pixel = 16 bytes,
+    // matching PF_PixelFloat layout).
+    A_long out_w = output->width;
+    A_long out_h = output->height;
+    A_long src_w = chunk.widthL;
+    A_long src_h = chunk.heightL;
+
+    // For 32bpc + identity adjust + unmult-off, we could memcpy each row.
+    // Keep the unified per-pixel loop for now — Phase 4.x can fast-path.
+    for (A_long y = 0; y < out_h; ++y) {
+        char* row = reinterpret_cast<char*>(output->data) + y * output->rowbytes;
+        bool y_in_range = (y >= 0 && y < src_h);
+        const float* src_row = y_in_range
+            ? reinterpret_cast<const float*>(
+                  reinterpret_cast<const char*>(chunk.dataPV) + y * chunk.row_bytesL)
+            : nullptr;
+
+        for (A_long x = 0; x < out_w; ++x) {
+            float fa = 0, fr = 0, fg = 0, fb_ = 0;
+            if (src_row && x >= 0 && x < src_w) {
+                const float* p = src_row + x * 4;
+                fa  = p[0]; fr  = p[1]; fg  = p[2]; fb_ = p[3];
+                ApplyAdjust(fr, fg, fb_, fa, black, white, unmult);
+            }
+
+            switch (fmt) {
+                case PF_PixelFormat_ARGB128: {
+                    PF_PixelFloat* po = reinterpret_cast<PF_PixelFloat*>(row) + x;
+                    po->alpha = fa; po->red = fr; po->green = fg; po->blue = fb_;
+                    break;
+                }
+                case PF_PixelFormat_ARGB64: {
+                    PF_Pixel16* po = reinterpret_cast<PF_Pixel16*>(row) + x;
+                    po->alpha = ClampTo16(fa);
+                    po->red   = ClampTo16(fr);
+                    po->green = ClampTo16(fg);
+                    po->blue  = ClampTo16(fb_);
+                    break;
+                }
+                default: {
+                    PF_Pixel8* po = reinterpret_cast<PF_Pixel8*>(row) + x;
+                    po->alpha = ClampTo8(fa);
+                    po->red   = ClampTo8(fr);
+                    po->green = ClampTo8(fg);
+                    po->blue  = ClampTo8(fb_);
+                    break;
+                }
+            }
+        }
+    }
+    auto t_done = clock::now();
+
+    cs->PF_CheckinLayerChannel(in_data->effect_ref, &ref, &chunk);
+    AEFX_ReleaseSuite(in_data, out_data, kPFChannelSuite1,
+                      kPFChannelSuiteVersion1, "channel suite");
+
+    if (timings) {
+        auto us = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+        };
+        // open = enumerate-and-find,  read = AE's cache checkout,
+        // convert = per-pixel adjust + format.
+        timings->open_us    = us(t_start,    t_resolved);
+        timings->read_us    = us(t_resolved, t_opened);
+        timings->convert_us = us(t_opened,   t_done);
+    }
+    return PF_Err_NONE;
+}
+
 // Append a single perf line to the desktop log. Cheap if file ops are
 // fast (and they are; debug log opens cache nicely).
 void LogPerf(const char* selector, long long total_us,
@@ -782,16 +991,14 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data,
     double white  = params[PARAM_WHITE]->u.fs_d.value;
     bool unmult   = params[PARAM_UNMULT]->u.bd.value != 0;
 
-    std::string path  = GetSourceExrPath(in_data, nullptr);
-    std::string layer = ResolveLayerByHash(path, hash);
-
     PF_PixelFormat fmt = GetOutputPixelFormat(in_data, out_data, output);
     RenderTimings rt;
-    PF_Err err = RenderExrLayer(path, layer, black, white, unmult, output, fmt, &rt);
+    PF_Err err = RenderViaChannelSuite(in_data, out_data, hash,
+                                       black, white, unmult, output, fmt, &rt);
 
     auto total = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now() - t_start).count();
-    LogPerf("Render", total, rt, path, layer);
+    LogPerf("Render", total, rt, "<channel-suite>", "");
     return err;
 }
 
@@ -799,28 +1006,29 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data,
 // with any SUPERVISE-flagged param). We open a modal layer picker, and
 // on a confirmed selection we update the Layer popup's display name to
 // show the chosen layer name plus stash the index back into the popup.
-PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* /*out_data*/,
+PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
                         PF_ParamDef* params[],
                         const PF_UserChangedParamExtra* which) {
     if (!which || which->param_index != PARAM_PICK_BUTTON) {
         return PF_Err_NONE;
     }
 
-    // Read the source EXR fresh on each click. PF_ProgPtr isn't stable
-    // across selectors so we can't reuse the SEQUENCE_SETUP cache key;
-    // header parse is microseconds and only runs on user interaction.
-    std::string diag;
-    std::string path = GetSourceExrPath(in_data, &diag);
-    std::vector<std::string> layers;
-    if (!path.empty()) layers = EnumerateExrLayers(path);
-    if (layers.empty()) return PF_Err_NONE;
+    // For the dialog we read the EXR file directly so we can present
+    // layers in Blender's authoring order. The channel suite only ever
+    // exposes them alphabetically. File parse takes a few ms — fine
+    // for an interactive click. (Render still uses the in-memory
+    // channel suite path; ordering doesn't matter there.)
+    std::string path = GetSourceExrPath(in_data, nullptr);
+    std::vector<std::string> display_names;
+    if (!path.empty()) display_names = EnumerateExrLayers(path);
+    if (display_names.empty()) return PF_Err_NONE;
 
-    int picked = ShowLayerPickerDialog(layers);
-    if (picked < 0 || picked >= static_cast<int>(layers.size())) {
+    int picked = ShowLayerPickerDialog(display_names);
+    if (picked < 0 || picked >= static_cast<int>(display_names.size())) {
         return PF_Err_NONE;  // user cancelled
     }
 
-    const std::string& name = layers[picked];
+    const std::string& name = display_names[picked];
     uint32_t hash = HashLayerName(name);
 
     // Persist:
@@ -874,15 +1082,20 @@ PF_Err SequenceSetup(PF_InData* /*in_data*/, PF_OutData* /*out_data*/) {
 // vanishes the next time AE re-renders the panel from scratch.
 //
 // We re-resolve the stored hash to a layer name and re-apply the label.
-PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* /*out_data*/,
+PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* out_data,
                      PF_ParamDef* params[]) {
     if (!params || !in_data || !in_data->effect_ref) return PF_Err_NONE;
 
     uint32_t hash = HashFromParams(params);
     if (hash == 0) return PF_Err_NONE;  // no selection yet
 
-    std::string path = GetSourceExrPath(in_data, nullptr);
-    std::string name = ResolveLayerByHash(path, hash);
+    // Resolve via channel suite — in-memory, no file read.
+    std::vector<ChannelEntry> entries =
+        EnumerateChannelSuiteLayers(in_data, out_data);
+    std::string name;
+    for (const auto& e : entries) {
+        if (HashLayerName(e.display_name) == hash) { name = e.display_name; break; }
+    }
 
     AEGP_SuiteHandler suites(in_data->pica_basicP);
     PF_ParamDef def;
@@ -919,74 +1132,10 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* /*out_data*/,
     return PF_Err_NONE;
 }
 
-// Probe AE's PF_ChannelSuite to see how many "extra" channels it
-// exposes for the source layer's footage. If the bundled importer
-// surfaces all of Blender's multipart channels here, we can refactor
-// the render path to read from AE's already-decoded channel cache
-// (option 1 from the perf plan) and skip the disk read entirely.
-//
-// Logs once per process to avoid spam.
-void ProbeChannelSuiteOnce(PF_InData* in_data, PF_OutData* out_data) {
-    static std::once_flag once;
-    std::call_once(once, [&]() {
-#ifdef AE_OS_WIN
-        if (!in_data || !out_data) return;
-
-        PF_ChannelSuite1* cs = nullptr;
-        if (AEFX_AcquireSuite(in_data, out_data, kPFChannelSuite1,
-                              kPFChannelSuiteVersion1, "channel suite",
-                              reinterpret_cast<void**>(&cs)) != PF_Err_NONE || !cs) {
-            return;
-        }
-
-        A_long count = 0;
-        cs->PF_GetLayerChannelCount(in_data->effect_ref, PARAM_INPUT, &count);
-
-        if (const char* home = std::getenv("USERPROFILE")) {
-            std::string log_path = std::string(home) + "\\Desktop\\exrdemux_perf.txt";
-            if (FILE* f = std::fopen(log_path.c_str(), "ab")) {
-                std::fprintf(f, "\n=== PF_ChannelSuite probe ===\n");
-                std::fprintf(f, "AE exposes %ld extra channels for the input layer\n",
-                             static_cast<long>(count));
-                for (A_long i = 0; i < count && i < 300; ++i) {
-                    PF_Boolean     found = FALSE;
-                    PF_ChannelRef  ref;
-                    PF_ChannelDesc desc;
-                    std::memset(&ref,  0, sizeof(ref));
-                    std::memset(&desc, 0, sizeof(desc));
-                    PF_Err qerr = cs->PF_GetLayerChannelIndexedRefAndDesc(
-                        in_data->effect_ref, PARAM_INPUT,
-                        static_cast<PF_ChannelIndex>(i),
-                        &found, &ref, &desc);
-                    if (qerr == PF_Err_NONE && found) {
-                        std::fprintf(f, "  [%ld] name=\"%s\" data_type=%d dims=%d\n",
-                                     static_cast<long>(i),
-                                     desc.name,
-                                     static_cast<int>(desc.data_type),
-                                     static_cast<int>(desc.dimension));
-                    } else {
-                        std::fprintf(f, "  [%ld] err=%d found=%d\n",
-                                     static_cast<long>(i),
-                                     static_cast<int>(qerr),
-                                     static_cast<int>(found));
-                    }
-                }
-                std::fprintf(f, "=== end probe ===\n\n");
-                std::fclose(f);
-            }
-        }
-
-        AEFX_ReleaseSuite(in_data, out_data, kPFChannelSuite1,
-                          kPFChannelSuiteVersion1, "channel suite");
-#endif
-    });
-}
-
 PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data,
                    PF_SmartRenderExtra* extra) {
     link_check_openexr();
     auto t_start = std::chrono::high_resolution_clock::now();
-    ProbeChannelSuiteOnce(in_data, out_data);
 
     PF_EffectWorld* output_worldP = nullptr;
     PF_Err err = extra->cb->checkout_output(in_data->effect_ref, &output_worldP);
@@ -1024,17 +1173,15 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data,
     uint32_t hash = ((static_cast<uint32_t>(hi_d) & 0xFFFFu) << 16)
                   |  (static_cast<uint32_t>(lo_d) & 0xFFFFu);
 
-    std::string path  = GetSourceExrPath(in_data, nullptr);
-    std::string layer = ResolveLayerByHash(path, hash);
-
     PF_PixelFormat fmt = GetOutputPixelFormat(in_data, out_data, output_worldP);
     RenderTimings rt;
-    PF_Err render_err = RenderExrLayer(path, layer, black, white, unmult,
-                                       output_worldP, fmt, &rt);
+    PF_Err render_err = RenderViaChannelSuite(in_data, out_data, hash,
+                                              black, white, unmult,
+                                              output_worldP, fmt, &rt);
 
     auto total = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now() - t_start).count();
-    LogPerf("SmartRender", total, rt, path, layer);
+    LogPerf("SmartRender", total, rt, "<channel-suite>", "");
     return render_err;
 }
 
