@@ -596,7 +596,8 @@ PF_Err RenderExrLayer(const std::string& path,
                       double black, double white, bool unmult,
                       PF_EffectWorld* output,
                       PF_PixelFormat fmt,
-                      RenderTimings* timings = nullptr) {
+                      RenderTimings* timings = nullptr,
+                      std::string* decoder_error_out = nullptr) {
     if (!output || !output->data) return PF_Err_NONE;
 
     if (path.empty() || layer_name.empty()) {
@@ -709,7 +710,13 @@ PF_Err RenderExrLayer(const std::string& path,
             timings->convert_us = us(t_read, t_done);
         }
         return PF_Err_NONE;
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+        // OpenEXR raises here for decoder failures (e.g. DWAB chunks that
+        // OpenEXR 3.4 can't decompress on certain Blender 5.x outputs) and
+        // for malformed files generally. Surface the message so the caller
+        // can choose to fall back to the channel-suite path; FillBlack so
+        // AE keeps rendering rather than erroring out.
+        if (decoder_error_out) *decoder_error_out = e.what();
         FillBlack(output, fmt);
         return PF_Err_NONE;
     }
@@ -722,9 +729,11 @@ PF_Err RenderExrLayer(const std::string& path,
 // to fresh pixel data under wrong names. We treat that as the trigger to
 // render via direct file read instead.
 //
-// AE's channel suite surfaces a layer as a 4-channel ARGB chunk when the
-// underlying part has at least R/G/B (A defaults to 1.0 when absent). The
-// file side mirrors that filter to keep the comparison apples-to-apples.
+// Both sides filter to layers that have R+G+B+A in the file. AE's channel
+// suite only surfaces 4-channel chunks (PF_ChannelSuite skips per-channel
+// scalars and 3-channel layers); the file side must match that filter or we
+// false-positive on staleness for any multilayer file containing 3-channel
+// passes (Blender's per-light AOVs, denoising AOVs, etc.).
 bool ChannelSuiteMatchesFile(const std::vector<ChannelEntry>& suite,
                               const ExrMetadata& file_meta) {
     std::set<std::string> suite_names;
@@ -733,7 +742,7 @@ bool ChannelSuiteMatchesFile(const std::vector<ChannelEntry>& suite,
     std::set<std::string> file_names;
     for (const auto& kv : file_meta.locations) {
         const LayerLocation& loc = kv.second;
-        if (loc.has_r && loc.has_g && loc.has_b) {
+        if (loc.has_r && loc.has_g && loc.has_b && loc.has_a) {
             file_names.insert(kv.first);
         }
     }
@@ -859,15 +868,20 @@ PF_Err RenderViaChannelSuiteEntries(
     return PF_Err_NONE;
 }
 
+// Forward decl — defined alongside LogPerf below. Called from RenderHash on
+// the unusual code paths (staleness mismatch, decoder-error fallback).
+void LogEvent(const std::string& message);
+
 // Top-level render dispatcher. Picks between the fast channel-suite path and
 // the slow file-direct path based on whether AE's importer agrees with the
 // EXR file on disk. After an in-place re-render AE's channel suite holds a
 // stale name list; we detect that and route through file-direct rendering so
 // the user's name-based selection still resolves correctly.
 //
-// On return, `path_kind_out` is "suite" for the fast path or "file" for the
-// fallback (caller logs it). `layer_out` is the resolved layer name (empty
-// if no match — output is then black).
+// On return, `path_kind_out` is "suite" for the fast path, "file" for the
+// fallback, or "file->suite" when file-direct's decoder threw and we recovered
+// via the suite (caller logs it). `layer_out` is the resolved layer name
+// (empty if no match — output is then black).
 PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
                   uint32_t hash, double black, double white, bool unmult,
                   PF_EffectWorld* output, PF_PixelFormat fmt,
@@ -903,13 +917,63 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
                                             output, fmt, timings);
     }
 
-    // Suite is stale (or we couldn't get a path). Fall back to direct file
-    // read so name-based selection survives in-place re-renders.
-    if (path_kind_out) *path_kind_out = "file";
+    // Mismatch between AE's surface and the EXR on disk — emit a one-time
+    // diagnostic so we can see exactly what AE exposes for files where the
+    // strict equality check trips. Limit volume by listing names only and
+    // truncating the lists.
+    if (!path.empty()) {
+        std::string msg = "Staleness-mismatch  path=" + path;
+        msg += "\n  suite[" + std::to_string(entries.size()) + "]:";
+        size_t n = 0;
+        for (const auto& e : entries) {
+            if (n++ >= 8) { msg += " ..."; break; }
+            msg += " '" + e.display_name + "'";
+        }
+        size_t file_4ch = 0;
+        for (const auto& kv : meta.locations) {
+            const LayerLocation& loc = kv.second;
+            if (loc.has_r && loc.has_g && loc.has_b && loc.has_a) ++file_4ch;
+        }
+        msg += "\n  file-4ch[" + std::to_string(file_4ch) + "]:";
+        n = 0;
+        for (const auto& kv : meta.locations) {
+            const LayerLocation& loc = kv.second;
+            if (!(loc.has_r && loc.has_g && loc.has_b && loc.has_a)) continue;
+            if (n++ >= 8) { msg += " ..."; break; }
+            msg += " '" + kv.first + "'";
+        }
+        LogEvent(msg);
+    }
+
+    // Suite is stale (or we couldn't get a path). Try direct file read first
+    // so name-based selection survives in-place re-renders. If the file's
+    // decoder throws (DWAB-on-Blender-5.x is the known case), fall back to
+    // suite render: AE's importer may have decoded successfully where our
+    // statically-linked OpenEXR can't.
     std::string layer = ResolveLayerByHash(meta, hash);
-    if (layer_out) *layer_out = layer;
-    return RenderExrLayer(path, layer, black, white, unmult,
-                          output, fmt, timings);
+    std::string decoder_err;
+    PF_Err err = RenderExrLayer(path, layer, black, white, unmult,
+                                output, fmt, timings, &decoder_err);
+    if (decoder_err.empty()) {
+        if (path_kind_out) *path_kind_out = "file";
+        if (layer_out) *layer_out = layer;
+        return err;
+    }
+
+    LogEvent("Decoder-error  " + decoder_err + "  path=" + path
+             + "  layer=" + layer + "  -> falling back to suite render");
+
+    if (path_kind_out) *path_kind_out = "file->suite";
+    if (layer_out) {
+        for (const auto& e : entries) {
+            if (HashLayerName(e.display_name) == hash) {
+                *layer_out = e.display_name; break;
+            }
+        }
+    }
+    return RenderViaChannelSuiteEntries(in_data, out_data, entries,
+                                        hash, black, white, unmult,
+                                        output, fmt, timings);
 }
 
 // Path to the user's Desktop, where we drop the diagnostic perf log.
@@ -946,6 +1010,20 @@ void LogPerf(const char* selector, long long total_us,
             selector, total_us, t.open_us, t.read_us, t.convert_us,
             layer.empty() ? "<none>" : layer.c_str(),
             path.empty() ? "<none>" : path.c_str());
+        std::fclose(f);
+    }
+}
+
+// Append an event line to the desktop log unconditionally — used for unusual
+// code paths (suite/file naming mismatch, decoder-error fallback) that we
+// want visibility into even when the user hasn't opted into perf logging.
+// Normal rendering produces no calls here, so the desktop file only appears
+// when something interesting happens.
+void LogEvent(const std::string& message) {
+    std::string log_path = DesktopFilePath("exrdemux_perf.txt");
+    if (log_path.empty()) return;
+    if (FILE* f = std::fopen(log_path.c_str(), "ab")) {
+        std::fprintf(f, "%s\n", message.c_str());
         std::fclose(f);
     }
 }
