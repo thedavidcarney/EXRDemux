@@ -63,9 +63,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <vector>
 #include <set>
 
@@ -398,8 +400,46 @@ struct ExrMetadata {
     std::map<std::string, LayerLocation> locations;
 };
 
-static std::mutex                            g_meta_mutex;
-static std::map<std::string, ExrMetadata>    g_meta_cache;
+// Cached metadata + the file fingerprint at the time we built it. mtime+size
+// catches in-place re-renders (same path, new bytes) — the original user-pain
+// case. AE's channel suite holds a stale name list across these re-renders;
+// we trust this file-side cache as the source of truth for "what's actually
+// in the EXR right now" and fall back to file-direct rendering when the
+// channel suite disagrees.
+struct CachedMeta {
+    int64_t     mtime_ns = 0;
+    int64_t     size     = 0;
+    ExrMetadata meta;
+};
+
+static std::mutex                          g_meta_mutex;
+static std::map<std::string, CachedMeta>   g_meta_cache;
+
+struct FileStamp {
+    int64_t mtime_ns = 0;
+    int64_t size     = 0;
+    bool    valid    = false;
+};
+
+FileStamp StampFile(const std::string& path) {
+    FileStamp s;
+    if (path.empty()) return s;
+    try {
+        std::error_code ec;
+        std::filesystem::path p(path);
+        if (!std::filesystem::is_regular_file(p, ec) || ec) return s;
+        auto ftime = std::filesystem::last_write_time(p, ec);
+        if (ec) return s;
+        s.mtime_ns = static_cast<int64_t>(ftime.time_since_epoch().count());
+        auto sz = std::filesystem::file_size(p, ec);
+        if (ec) return s;
+        s.size = static_cast<int64_t>(sz);
+        s.valid = true;
+    } catch (...) {
+        // std::filesystem can throw on weird paths on Windows; treat as no-stamp.
+    }
+    return s;
+}
 
 // Build (without locking) — caller must already hold the lock if mutating.
 ExrMetadata BuildExrMetadata(const std::string& path) {
@@ -429,10 +469,16 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
                 }
 
                 LayerLocation& loc = meta.locations[layer];
-                if (suffix == "R") { loc.r_name = ch_name; loc.has_r = true; }
-                else if (suffix == "G") { loc.g_name = ch_name; loc.has_g = true; }
-                else if (suffix == "B") { loc.b_name = ch_name; loc.has_b = true; }
-                else if (suffix == "A") { loc.a_name = ch_name; loc.has_a = true; }
+                // Cryptomattes (and some other non-color channels) use
+                // lowercase r/g/b/a per OpenEXR convention. AE's channel
+                // suite still surfaces them as 4-channel ARGB chunks; if we
+                // didn't recognize the lowercase form here, file_names would
+                // be missing those layers and ChannelSuiteMatchesFile would
+                // false-positive on staleness, killing the suite fast path.
+                if      (suffix == "R" || suffix == "r") { loc.r_name = ch_name; loc.has_r = true; }
+                else if (suffix == "G" || suffix == "g") { loc.g_name = ch_name; loc.has_g = true; }
+                else if (suffix == "B" || suffix == "b") { loc.b_name = ch_name; loc.has_b = true; }
+                else if (suffix == "A" || suffix == "a") { loc.a_name = ch_name; loc.has_a = true; }
             }
         }
         if (has_default) {
@@ -444,33 +490,55 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
     return meta;
 }
 
-// Returns metadata for the given file. Builds on cache miss; subsequent
-// calls return the cached copy.
+// Returns metadata for the given file. Stat-validated: if the file's mtime
+// or size has changed since the cached entry was built, we rebuild. This is
+// what makes in-place re-renders work — same path, new contents, new
+// metadata.
 ExrMetadata GetExrMetadata(const std::string& path) {
+    if (path.empty()) return {};
+    FileStamp stamp = StampFile(path);
+
     {
         std::lock_guard<std::mutex> lock(g_meta_mutex);
         auto it = g_meta_cache.find(path);
-        if (it != g_meta_cache.end()) return it->second;
+        if (it != g_meta_cache.end()) {
+            const CachedMeta& c = it->second;
+            // No valid stamp (file just vanished, network glitch, etc.):
+            // trust the cache rather than blowing it away.
+            if (!stamp.valid) return c.meta;
+            if (c.mtime_ns == stamp.mtime_ns && c.size == stamp.size) {
+                return c.meta;
+            }
+        }
     }
 
     // Build outside the lock so concurrent renders don't block each other.
     ExrMetadata fresh = BuildExrMetadata(path);
 
-    {
+    if (stamp.valid) {
         std::lock_guard<std::mutex> lock(g_meta_mutex);
-        g_meta_cache[path] = fresh;
+        CachedMeta entry;
+        entry.mtime_ns = stamp.mtime_ns;
+        entry.size     = stamp.size;
+        entry.meta     = fresh;
+        g_meta_cache[path] = entry;
     }
     return fresh;
 }
 
-// Look up the layer name whose hash matches `hash`. Empty string = no match.
-std::string ResolveLayerByHash(const std::string& path, uint32_t hash) {
-    if (path.empty()) return "";
-    ExrMetadata meta = GetExrMetadata(path);
+// Look up the layer name whose hash matches `hash` against pre-fetched
+// metadata. Empty string = no match.
+std::string ResolveLayerByHash(const ExrMetadata& meta, uint32_t hash) {
     for (const auto& layer : meta.layers) {
         if (HashLayerName(layer) == hash) return layer;
     }
     return "";
+}
+
+// Convenience wrapper for callers that don't already have metadata in hand.
+std::string ResolveLayerByHash(const std::string& path, uint32_t hash) {
+    if (path.empty()) return "";
+    return ResolveLayerByHash(GetExrMetadata(path), hash);
 }
 
 // Apply Black/White Point rescaling and optional UnMult, in place.
@@ -647,21 +715,47 @@ PF_Err RenderExrLayer(const std::string& path,
     }
 }
 
+// True when AE's channel-suite enumeration agrees with the EXR file on disk
+// about which 4-channel layers exist. When false, AE's importer is holding a
+// stale name list (typical after an in-place re-render — see commit
+// "Mac scaffolding..." era for the diagnosis) and the suite's refs may point
+// to fresh pixel data under wrong names. We treat that as the trigger to
+// render via direct file read instead.
+//
+// AE's channel suite surfaces a layer as a 4-channel ARGB chunk when the
+// underlying part has at least R/G/B (A defaults to 1.0 when absent). The
+// file side mirrors that filter to keep the comparison apples-to-apples.
+bool ChannelSuiteMatchesFile(const std::vector<ChannelEntry>& suite,
+                              const ExrMetadata& file_meta) {
+    std::set<std::string> suite_names;
+    for (const auto& e : suite) suite_names.insert(e.display_name);
+
+    std::set<std::string> file_names;
+    for (const auto& kv : file_meta.locations) {
+        const LayerLocation& loc = kv.second;
+        if (loc.has_r && loc.has_g && loc.has_b) {
+            file_names.insert(kv.first);
+        }
+    }
+    return suite_names == file_names;
+}
+
 // Read the chosen layer's ARGB chunk via PF_ChannelSuite (data already
 // decoded by AE's importer — no file read), apply Black/White Point +
-// UnMult, write to the output world in its native pixel format.
-PF_Err RenderViaChannelSuite(PF_InData* in_data, PF_OutData* out_data,
-                              uint32_t hash, double black, double white, bool unmult,
-                              PF_EffectWorld* output, PF_PixelFormat fmt,
-                              RenderTimings* timings = nullptr) {
+// UnMult, write to the output world in its native pixel format. Caller has
+// already enumerated entries and confirmed the suite is fresh.
+PF_Err RenderViaChannelSuiteEntries(
+        PF_InData* in_data, PF_OutData* out_data,
+        const std::vector<ChannelEntry>& entries,
+        uint32_t hash, double black, double white, bool unmult,
+        PF_EffectWorld* output, PF_PixelFormat fmt,
+        RenderTimings* timings = nullptr) {
     if (!output || !output->data) return PF_Err_NONE;
     if (timings) *timings = RenderTimings{};
 
     using clock = std::chrono::high_resolution_clock;
     auto t_start = clock::now();
 
-    // Find the channel matching our stored hash.
-    std::vector<ChannelEntry> entries = EnumerateChannelSuiteLayers(in_data, out_data);
     const ChannelEntry* picked = nullptr;
     for (const auto& e : entries) {
         if (HashLayerName(e.display_name) == hash) { picked = &e; break; }
@@ -765,6 +859,59 @@ PF_Err RenderViaChannelSuite(PF_InData* in_data, PF_OutData* out_data,
     return PF_Err_NONE;
 }
 
+// Top-level render dispatcher. Picks between the fast channel-suite path and
+// the slow file-direct path based on whether AE's importer agrees with the
+// EXR file on disk. After an in-place re-render AE's channel suite holds a
+// stale name list; we detect that and route through file-direct rendering so
+// the user's name-based selection still resolves correctly.
+//
+// On return, `path_kind_out` is "suite" for the fast path or "file" for the
+// fallback (caller logs it). `layer_out` is the resolved layer name (empty
+// if no match — output is then black).
+PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
+                  uint32_t hash, double black, double white, bool unmult,
+                  PF_EffectWorld* output, PF_PixelFormat fmt,
+                  RenderTimings* timings,
+                  const char** path_kind_out,
+                  std::string* layer_out) {
+    if (path_kind_out) *path_kind_out = "?";
+    if (layer_out) layer_out->clear();
+    if (timings) *timings = RenderTimings{};
+
+    // File side: path + (mtime-validated) metadata.
+    std::string path = GetSourceExrPath(in_data, nullptr);
+    ExrMetadata meta = path.empty() ? ExrMetadata{} : GetExrMetadata(path);
+
+    // Channel-suite side: enumerate every render. Cheap (no file I/O), and
+    // gives us both the staleness signal and the refs for the fast path.
+    std::vector<ChannelEntry> entries =
+        EnumerateChannelSuiteLayers(in_data, out_data);
+
+    bool fresh = !path.empty() && ChannelSuiteMatchesFile(entries, meta);
+
+    if (fresh) {
+        if (path_kind_out) *path_kind_out = "suite";
+        if (layer_out) {
+            for (const auto& e : entries) {
+                if (HashLayerName(e.display_name) == hash) {
+                    *layer_out = e.display_name; break;
+                }
+            }
+        }
+        return RenderViaChannelSuiteEntries(in_data, out_data, entries,
+                                            hash, black, white, unmult,
+                                            output, fmt, timings);
+    }
+
+    // Suite is stale (or we couldn't get a path). Fall back to direct file
+    // read so name-based selection survives in-place re-renders.
+    if (path_kind_out) *path_kind_out = "file";
+    std::string layer = ResolveLayerByHash(meta, hash);
+    if (layer_out) *layer_out = layer;
+    return RenderExrLayer(path, layer, black, white, unmult,
+                          output, fmt, timings);
+}
+
 // Path to the user's Desktop, where we drop the diagnostic perf log.
 // Empty string if unavailable. Used only for development debugging.
 std::string DesktopFilePath(const char* filename) {
@@ -780,11 +927,17 @@ std::string DesktopFilePath(const char* filename) {
     return std::string();
 }
 
-// Append a single perf line to the desktop log. Cheap if file ops are
-// fast (and they are; debug log opens cache nicely).
+// Append a single perf line to the desktop log. No-op unless the user has
+// opted in via the EXRDEMUX_PERF_LOG environment variable (any non-empty
+// value enables it). Keeps the diagnostic available when needed without
+// scattering exrdemux_perf.txt onto every teammate's desktop in the common
+// case.
 void LogPerf(const char* selector, long long total_us,
              const RenderTimings& t, const std::string& path,
              const std::string& layer) {
+    const char* opt_in = std::getenv("EXRDEMUX_PERF_LOG");
+    if (!opt_in || opt_in[0] == '\0') return;
+
     std::string log_path = DesktopFilePath("exrdemux_perf.txt");
     if (log_path.empty()) return;
     if (FILE* f = std::fopen(log_path.c_str(), "ab")) {
@@ -860,23 +1013,31 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data,
     // (a single 32-bit hash slider rounds to the nearest representable
     // float and corrupts integer hashes above ~16M). Hidden from UI;
     // populated on Pick Layer click and read at render time.
+    //
+    // We use PF_ADD_FLOAT_SLIDER (not the *X variant) because *X calls
+    // AEFX_CLR_STRUCT(def) internally — wiping our ui_flags = INVISIBLE
+    // before AE sees it. The non-X form lets pre-set ui_flags survive.
     AEFX_CLR_STRUCT(def);
     def.flags    = PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP;
     def.ui_flags = PF_PUI_INVISIBLE;
-    PF_ADD_FLOAT_SLIDERX("Layer Hash Hi",
-                         0, 65535, 0, 65535, 0.0, 0,
-                         PF_ValueDisplayFlag_NONE,
-                         PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP,
-                         ID_HASH_HI);
+    PF_ADD_FLOAT_SLIDER("Layer Hash Hi",
+                        0, 65535, 0, 65535,
+                        AEFX_DEFAULT_CURVE_TOLERANCE,
+                        0.0, 0,
+                        PF_ValueDisplayFlag_NONE,
+                        false,
+                        ID_HASH_HI);
 
     AEFX_CLR_STRUCT(def);
     def.flags    = PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP;
     def.ui_flags = PF_PUI_INVISIBLE;
-    PF_ADD_FLOAT_SLIDERX("Layer Hash Lo",
-                         0, 65535, 0, 65535, 0.0, 0,
-                         PF_ValueDisplayFlag_NONE,
-                         PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP,
-                         ID_HASH_LO);
+    PF_ADD_FLOAT_SLIDER("Layer Hash Lo",
+                        0, 65535, 0, 65535,
+                        AEFX_DEFAULT_CURVE_TOLERANCE,
+                        0.0, 0,
+                        PF_ValueDisplayFlag_NONE,
+                        false,
+                        ID_HASH_LO);
 
     // [3] Black Point — same intent as EXtractoR's Black Point.
     AEFX_CLR_STRUCT(def);
@@ -943,12 +1104,17 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data,
 
     PF_PixelFormat fmt = GetOutputPixelFormat(in_data, out_data, output);
     RenderTimings rt;
-    PF_Err err = RenderViaChannelSuite(in_data, out_data, hash,
-                                       black, white, unmult, output, fmt, &rt);
+    const char* path_kind = "?";
+    std::string layer_used;
+    PF_Err err = RenderHash(in_data, out_data, hash,
+                            black, white, unmult, output, fmt,
+                            &rt, &path_kind, &layer_used);
 
     auto total = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now() - t_start).count();
-    LogPerf("Render", total, rt, "<channel-suite>", "");
+    char selector[32];
+    std::snprintf(selector, sizeof(selector), "Render(%s)", path_kind);
+    LogPerf(selector, total, rt, path_kind, layer_used);
     return err;
 }
 
@@ -1032,6 +1198,9 @@ PF_Err SequenceSetup(PF_InData* /*in_data*/, PF_OutData* /*out_data*/) {
 // vanishes the next time AE re-renders the panel from scratch.
 //
 // We re-resolve the stored hash to a layer name and re-apply the label.
+// File enum is the primary source: it always reflects the current EXR (the
+// metadata cache auto-invalidates on mtime change). Channel-suite enum is a
+// fallback for the brief window where AEGP isn't ready to give us a path.
 PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* out_data,
                      PF_ParamDef* params[]) {
     if (!params || !in_data || !in_data->effect_ref) return PF_Err_NONE;
@@ -1039,12 +1208,24 @@ PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* out_data,
     uint32_t hash = HashFromParams(params);
     if (hash == 0) return PF_Err_NONE;  // no selection yet
 
-    // Resolve via channel suite — in-memory, no file read.
-    std::vector<ChannelEntry> entries =
-        EnumerateChannelSuiteLayers(in_data, out_data);
     std::string name;
-    for (const auto& e : entries) {
-        if (HashLayerName(e.display_name) == hash) { name = e.display_name; break; }
+    std::string path = GetSourceExrPath(in_data, nullptr);
+    if (!path.empty()) {
+        // Authoritative: if file metadata is available, the answer here is
+        // the answer. An empty name means the hash truly doesn't match a
+        // layer in the current file → label as (missing).
+        name = ResolveLayerByHash(GetExrMetadata(path), hash);
+    } else {
+        // No path (AEGP not ready yet for this effect). Fall back to the
+        // channel-suite enum — it may be stale after re-renders, but it's
+        // all we have in this transient window.
+        std::vector<ChannelEntry> entries =
+            EnumerateChannelSuiteLayers(in_data, out_data);
+        for (const auto& e : entries) {
+            if (HashLayerName(e.display_name) == hash) {
+                name = e.display_name; break;
+            }
+        }
     }
 
     AEGP_SuiteHandler suites(in_data->pica_basicP);
@@ -1125,13 +1306,18 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data,
 
     PF_PixelFormat fmt = GetOutputPixelFormat(in_data, out_data, output_worldP);
     RenderTimings rt;
-    PF_Err render_err = RenderViaChannelSuite(in_data, out_data, hash,
-                                              black, white, unmult,
-                                              output_worldP, fmt, &rt);
+    const char* path_kind = "?";
+    std::string layer_used;
+    PF_Err render_err = RenderHash(in_data, out_data, hash,
+                                   black, white, unmult,
+                                   output_worldP, fmt,
+                                   &rt, &path_kind, &layer_used);
 
     auto total = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now() - t_start).count();
-    LogPerf("SmartRender", total, rt, "<channel-suite>", "");
+    char selector[32];
+    std::snprintf(selector, sizeof(selector), "SmartRender(%s)", path_kind);
+    LogPerf(selector, total, rt, path_kind, layer_used);
     return render_err;
 }
 
