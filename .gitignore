@@ -5,6 +5,7 @@ third_party/AfterEffectsSDK/
 build/
 out/
 cmake-build-*/
+release/
 
 # --- Visual Studio / VS Code local state ---
 .vs/
