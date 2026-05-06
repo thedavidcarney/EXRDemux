@@ -156,10 +156,14 @@ elseif(APPLE)
     # Rez doesn't auto-define AE_OS_MAC, so pass it explicitly. The
     # SDK's AE_General.r is the macOS-side Resource header with type
     # definitions; -i adds the include path.
+    # -useDF: write the resource map into the data fork. Without it Rez
+    # uses the legacy HFS resource fork, which file copies and the cmake
+    # bundle install both strip — leaving an empty .rsrc in the bundle.
     add_custom_command(
         OUTPUT "${PIPL_RSRC}"
         DEPENDS "${PIPL_INPUT}"
         COMMAND "${REZ_EXECUTABLE}"
+                -useDF
                 -d "AE_OS_MAC"
                 -d "ARCH_64"
                 -i "${AE_SDK_HEADERS}"

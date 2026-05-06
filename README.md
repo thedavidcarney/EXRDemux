@@ -19,7 +19,7 @@ A working v1 of a replacement for fnordware's EXtractoR for After Effects on Win
 ## Things I didn't test very much
 
 - Any AE version other than 2025
-- Mac (not compiled yet)
+- Mac (compiles and loads in AE 2025 on Apple Silicon; layer pick + Black/White Point verified, but UnMult and re-render persistence are untested on Mac)
 - Black Point / White Point / UnMult
 - Anything other than barebones test comps with no other effects
 
@@ -27,7 +27,11 @@ Any testing helps. Feedback or wishlists welcome.
 
 ## Install
 
-Drop `EXRDemux.aex` into your AE Plug-ins folder and restart AE. Effect appears under **Effect → EXR → EXRDemux**.
+**Windows:** drop `EXRDemux.aex` into `C:\Program Files\Adobe\Adobe After Effects 2025\Support Files\Plug-ins\` and restart AE.
+
+**macOS:** drop `EXRDemux.plugin` into `/Applications/Adobe After Effects 2025/Plug-ins/` and restart AE. The bundle is ad-hoc signed; if Gatekeeper blocks it, run `xattr -dr com.apple.quarantine /Applications/Adobe\ After\ Effects\ 2025/Plug-ins/EXRDemux.plugin`.
+
+Effect appears under **Effect → EXR → EXRDemux**.
 
 ## Acknowledgements
 
