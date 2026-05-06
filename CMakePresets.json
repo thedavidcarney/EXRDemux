@@ -34,9 +34,11 @@
             "generator": "Ninja",
             "toolchainFile": "${sourceDir}/third_party/vcpkg/scripts/buildsystems/vcpkg.cmake",
             "cacheVariables": {
+                "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/overlay-triplets",
                 "VCPKG_TARGET_TRIPLET": "arm64-osx",
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_OSX_ARCHITECTURES": "arm64"
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0"
             },
             "condition": {
                 "type": "equals",

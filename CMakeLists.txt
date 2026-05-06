@@ -14,10 +14,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Match vcpkg's runtime: dynamic CRT (/MD or /MDd).
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
-# macOS deployment target — keep modest so we don't gratuitously block
-# older Macs. AE 2025 itself drops support for older OSes anyway.
+# macOS deployment target. arm64 minimum is 11.0 (Big Sur, first OS
+# with Apple Silicon support); 10.15 is moot for our arm64-only build.
+# Must match VCPKG_OSX_DEPLOYMENT_TARGET in cmake/overlay-triplets/
+# arm64-osx.cmake or vcpkg's static libs will be built against a
+# different (typically newer) SDK and reference symbols missing on
+# older macOS.
 if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15"
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0"
         CACHE STRING "Minimum macOS version" FORCE)
 endif()
 
