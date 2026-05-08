@@ -84,6 +84,12 @@
 #define EXRDEMUX_STAGE_VERSION PF_Stage_DEVELOP
 #define EXRDEMUX_BUILD_VERSION 1
 
+// User-visible version string displayed in the About param at the bottom
+// of the Effect Controls panel. MUST be bumped on every release. See
+// CLAUDE.md "Release checklist" — this and the version macros above plus
+// AE_Effect_Version in exrdemux.r move together.
+#define EXRDEMUX_VERSION_STRING "v0.2.2"
+
 namespace {
 
 enum {
@@ -95,6 +101,7 @@ enum {
     PARAM_BLACK,
     PARAM_WHITE,
     PARAM_UNMULT,
+    PARAM_ABOUT,
     PARAM_COUNT
 };
 
@@ -105,13 +112,14 @@ enum {
 // round-trips through 32-bit float somewhere in AE's persistence path,
 // and integers above ~16M lose precision. 16-bit halves stay exact.
 enum {
-    ID_LAYER       = 1,
-    ID_BLACK       = 3,
-    ID_WHITE       = 4,
-    ID_UNMULT      = 5,
-    ID_PICK_BUTTON = 6,
-    ID_HASH_HI     = 7,
-    ID_HASH_LO     = 8
+    ID_LAYER        = 1,
+    ID_BLACK        = 3,
+    ID_WHITE        = 4,
+    ID_UNMULT       = 5,
+    ID_PICK_BUTTON  = 6,
+    ID_HASH_HI      = 7,
+    ID_HASH_LO      = 8,
+    ID_ABOUT        = 9
     // ID 2 retired (was a single 32-bit hash, lost precision).
 };
 
@@ -1142,6 +1150,17 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data,
     // [5] UnMult — same intent as EXtractoR's UnMult.
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOX("UnMult", "", FALSE, 0, ID_UNMULT);
+
+    // [6] About — passive button at the bottom of the Effect Controls panel
+    // showing the plugin version. No SUPERVISE flag, so clicking it is a
+    // no-op (AE re-renders, that's fine). Update EXRDEMUX_VERSION_STRING on
+    // every release; see CLAUDE.md "Release checklist."
+    AEFX_CLR_STRUCT(def);
+    def.param_type = PF_Param_BUTTON;
+    PF_STRNNCPY(def.PF_DEF_NAME, "EXRDemux", sizeof(def.PF_DEF_NAME));
+    def.u.button_d.u.PF_DEF_NAMESPTR = EXRDEMUX_VERSION_STRING;
+    def.uu.id = ID_ABOUT;
+    if (PF_Err pe = PF_ADD_PARAM(in_data, -1, &def)) return pe;
 
     out_data->num_params = PARAM_COUNT;
     return err;
