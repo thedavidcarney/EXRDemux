@@ -24,7 +24,6 @@ xcrun --find Rez      # Apple's resource compiler
 ## Repo + dependencies
 
 ```sh
-cd ~/somewhere
 git clone https://github.com/thedavidcarney/EXRDemux.git
 cd EXRDemux
 
@@ -63,7 +62,6 @@ download it once on the Mac mini just like you did on Windows.
 ## First build
 
 ```sh
-cd ~/somewhere/EXRDemux
 cmake --preset mac-arm64-release   # configures + installs vcpkg deps
 cmake --build --preset mac-arm64-release
 ```
@@ -101,33 +99,23 @@ universal binary that runs on both Intel and Apple Silicon Macs, edit
 this may require a custom vcpkg triplet. For now, single-arch is
 simpler and matches what most testing on a single machine needs.)
 
-## Known unknowns (parts I wrote blind on Windows)
+## Caveats
 
-These are likely to need tweaking on first Mac build:
-
-- **The Rez invocation.** I pass `-d AE_OS_MAC -d ARCH_64` and include
-  paths for `Headers/` + `Resources/`. If Rez complains about missing
-  types or undefined symbols, the include paths probably need to be
-  adjusted, or extra `-d` defines added.
-- **The `.mm` dialog.** It's a basic NSAlert with an NSPopUpButton
-  accessory view. Should work. If the modal doesn't show, the issue is
-  most likely with how AE's run loop interacts with `[NSAlert runModal]`
-  — a fallback is a custom NSWindow + `[NSApp runModalForWindow:]`.
-- **Bundle structure.** AE's Mac plugin spec wants `CFBundlePackageType
-  = "eFKT"` and the .rsrc inside `Contents/Resources/`. I set both, but
-  a real Mac AE may want `CFBundleSignature = "FXTC"` swapped for some
-  other 4-char code, or extra Info.plist keys.
-- **vcpkg arm64-osx triplet** for OpenEXR may not have prebuilt
-  binaries cached, so first configure could spend several minutes
-  building OpenEXR + Imath from source. Subsequent configures are
-  fast.
-- **Code signing**: macOS may refuse to load an unsigned plugin.
-  Quick workaround for development:
+- **First vcpkg build is slow.** The arm64-osx triplet may not have
+  prebuilt binaries cached, so the first `cmake --preset` can spend
+  several minutes building OpenEXR + Imath from source. Subsequent
+  configures are fast.
+- **Don't strip the deployment-target overlay triplet** at
+  `cmake/overlay-triplets/arm64-osx.cmake`. It pins
+  `VCPKG_OSX_DEPLOYMENT_TARGET=11.0` so vcpkg builds OpenEXR/Imath
+  against an SDK that older macOS hosts can actually load. Without
+  this, the binaries fail at runtime on anything but the build host.
+- **Ad-hoc code signing.** macOS Gatekeeper may refuse to load an
+  unsigned plugin. For dev, sign the bundle ad-hoc after each build:
   ```sh
   codesign --force --deep --sign - build/mac-arm64-release/EXRDemux.plugin
   ```
-  Self-signed (the `-` argument). For distribution you'd need a real
-  developer certificate.
-
-When the build/load issues surface, paste the errors back to the
-Windows session — most are one- or two-line fixes.
+  End users hit the same issue and clear it with
+  `xattr -dr com.apple.quarantine /Applications/...EXRDemux.plugin`
+  (README has the full command). Real notarization is on the roadmap
+  but not wired up yet.

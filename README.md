@@ -33,6 +33,30 @@ Any testing helps. Feedback or wishlists welcome.
 
 Effect appears under **Effect → EXR → EXRDemux**.
 
+## Scripts
+
+### `scripts/SplitAndSortPassesToPrecomps.jsx`
+
+Bulk setup for multilayer EXRs. Takes a selected EXR footage item and
+builds:
+
+- One precomp per layer, with EXRDemux applied and the correct layer
+  pre-selected by name hash (so the selection survives re-renders).
+- A Master Comp that stacks every precomp with Lighten blending and
+  label colors grouped by shared name prefix. `Image` / `Alpha` /
+  `World` / `Ambient` / `HDRI` passes are pinned at the bottom and
+  disabled by default. Cryptomattes are skipped from the Master Comp
+  entirely (the precomps still exist).
+
+Run from After Effects: **File → Scripts → Run Script File…** and pick
+the `.jsx` from the `scripts/` folder of this repo.
+
+A startup dialog asks how to order the regular-light block in the
+Master Comp. Today only **Layers In Order** is enabled. The spatial
+modes (Auto Left to Right, Auto Top to Bottom, Front to Back, Random)
+are scaffolded for a planned companion tool that emits a JSON sidecar
+of per-layer luminance centroids.
+
 ## Acknowledgements
 
 EXRDemux exists because Brendan Bolles / fnordware built [EXtractoR](https://www.fnordware.com/ProEXR/), the standard tool for multilayer EXRs in AE for nearly twenty years. None of his code is in this binary, but EXRDemux's parameter design follows EXtractoR's conventions deliberately, and Brendan's long-running contributions to OpenEXR itself underpin the libraries we link. Thanks, Brendan.
