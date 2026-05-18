@@ -79,16 +79,16 @@
 #endif
 
 #define EXRDEMUX_MAJOR_VERSION 0
-#define EXRDEMUX_MINOR_VERSION 1
+#define EXRDEMUX_MINOR_VERSION 9
 #define EXRDEMUX_BUG_VERSION   0
-#define EXRDEMUX_STAGE_VERSION PF_Stage_DEVELOP
+#define EXRDEMUX_STAGE_VERSION PF_Stage_RELEASE
 #define EXRDEMUX_BUILD_VERSION 1
 
 // User-visible version string displayed in the About param at the bottom
 // of the Effect Controls panel. MUST be bumped on every release. See
 // CLAUDE.md "Release checklist" — this and the version macros above plus
 // AE_Effect_Version in exrdemux.r move together.
-#define EXRDEMUX_VERSION_STRING "v0.2.2"
+#define EXRDEMUX_VERSION_STRING "v0.9.0"
 
 namespace {
 

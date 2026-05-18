@@ -18,18 +18,18 @@ A working v1 of a replacement for fnordware's EXtractoR for After Effects on Win
 
 ## Things I didn't test very much
 
-- Any AE version other than 2025
-- Mac (compiles and loads in AE 2025 on Apple Silicon; layer pick + Black/White Point verified, but UnMult and re-render persistence are untested on Mac)
+- AE versions other than 2025 and 2026. **v0.9.0 is the 1.0 release candidate aimed at AE 2026** — it builds and installs on Win x64 + macOS arm64 for AE 2026, but broad real-comp testing there is exactly what this RC is for. AE 2025 has the most mileage so far.
+- Mac (builds and loads on Apple Silicon for AE 2025/2026; layer pick + Black/White Point verified on AE 2025, but UnMult, re-render persistence, and JSX scriptability are untested on Mac)
 - Black Point / White Point / UnMult
 - Anything other than barebones test comps with no other effects
 
-Any testing helps. Feedback or wishlists welcome.
+Any testing helps — AE 2026 feedback especially. Feedback or wishlists welcome.
 
 ## Install
 
-**Windows:** drop `EXRDemux.aex` into `C:\Program Files\Adobe\Adobe After Effects 2025\Support Files\Plug-ins\` and restart AE.
+**Windows:** drop `EXRDemux.aex` into `C:\Program Files\Adobe\Adobe After Effects <version>\Support Files\Plug-ins\` (e.g. `Adobe After Effects 2026`) and restart AE.
 
-**macOS:** drop `EXRDemux.plugin` into `/Applications/Adobe After Effects 2025/Plug-ins/` and restart AE. The bundle is ad-hoc signed; if Gatekeeper blocks it, run `xattr -dr com.apple.quarantine /Applications/Adobe\ After\ Effects\ 2025/Plug-ins/EXRDemux.plugin`.
+**macOS:** drop `EXRDemux.plugin` into `/Applications/Adobe After Effects <version>/Plug-ins/` (e.g. `Adobe After Effects 2026`) and restart AE. The bundle is ad-hoc signed; if Gatekeeper blocks it, run `xattr -dr com.apple.quarantine "/Applications/Adobe After Effects <version>/Plug-ins/EXRDemux.plugin"`.
 
 Effect appears under **Effect → EXR → EXRDemux**.
 
