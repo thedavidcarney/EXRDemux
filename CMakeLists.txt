@@ -56,6 +56,7 @@ endif()
 # ----- Plugin target -----
 add_library(EXRDemux MODULE
     src/exrdemux.cpp
+    src/exrdemux_pass_cache.cpp
     "${AE_SDK_UTIL}/AEGP_SuiteHandler.cpp"
     "${AE_SDK_UTIL}/AEFX_SuiteHelper.c"
     "${AE_SDK_UTIL}/MissingSuiteError.cpp"
@@ -196,6 +197,18 @@ elseif(APPLE)
         COMMAND codesign --force --deep --sign - "$<TARGET_BUNDLE_DIR:EXRDemux>"
         COMMENT "Ad-hoc signing the assembled .plugin bundle"
         VERBATIM)
+endif()
+
+# ----- Pass-cache bench (optional, no AE needed) -----
+# Exercises src/exrdemux_pass_cache.cpp against a real multipart EXR:
+# shared decode, multithreaded hits, and in-place re-render detection.
+option(EXRDEMUX_BUILD_BENCH "Build the pass-cache bench tool" OFF)
+if(EXRDEMUX_BUILD_BENCH)
+    add_executable(pass_cache_bench
+        bench/pass_cache_bench.cpp
+        src/exrdemux_pass_cache.cpp)
+    target_include_directories(pass_cache_bench PRIVATE src)
+    target_link_libraries(pass_cache_bench PRIVATE OpenEXR::OpenEXR Imath::Imath)
 endif()
 
 # Quiet a few MSVC warnings the SDK headers trip but we can't fix.

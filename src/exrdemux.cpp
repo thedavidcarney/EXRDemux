@@ -50,6 +50,7 @@
 #include "AEGP_SuiteHandler.h"
 
 #include "exrdemux_dialog.h"
+#include "exrdemux_pass_cache.h"
 
 #include <Imath/half.h>
 #include <ImfMultiPartInputFile.h>
@@ -452,6 +453,8 @@ struct LayerLocation {
     int part_idx = -1;
     std::string r_name, g_name, b_name, a_name;
     bool has_r = false, has_g = false, has_b = false, has_a = false;
+    bool all_half = true;          // every R/G/B/A channel is stored as HALF
+    bool data_is_display = false;  // part's data window == display window
 };
 
 // Cached per-file metadata so repeated renders / UI redraws don't re-parse
@@ -529,7 +532,10 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
 
                 if (seen.insert(layer).second) {
                     meta.layers.push_back(layer);
-                    meta.locations[layer].part_idx = p;
+                    LayerLocation& first = meta.locations[layer];
+                    first.part_idx = p;
+                    first.data_is_display =
+                        file.header(p).dataWindow() == file.header(p).displayWindow();
                 }
 
                 LayerLocation& loc = meta.locations[layer];
@@ -543,6 +549,8 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
                 else if (suffix == "G" || suffix == "g") { loc.g_name = ch_name; loc.has_g = true; }
                 else if (suffix == "B" || suffix == "b") { loc.b_name = ch_name; loc.has_b = true; }
                 else if (suffix == "A" || suffix == "a") { loc.a_name = ch_name; loc.has_a = true; }
+                else continue;
+                if (it.channel().type != Imf::HALF) loc.all_half = false;
             }
         }
         if (has_default) {
@@ -685,7 +693,75 @@ struct RenderTimings {
     long long read_us = 0;
     long long convert_us = 0;
     long src_w = 0, src_h = 0;   // source pixels we sampled from
+    bool cached = false;         // served from the shared pass cache
 };
+
+// Write a cached pass into the output world. `col` / `rowmap` come from
+// SourceIndexMap exactly as the uncached paths build them, and the per-pixel
+// work (half -> float, ApplyAdjust, clamp) is the same, so the output is
+// bit-identical to the uncached render of the same source pixels.
+void WritePassToOutput(const exrdemux::PassPixels& px,
+                       const std::vector<int>& col,
+                       const std::vector<int>& rowmap,
+                       double black, double white, bool unmult,
+                       PF_EffectWorld* output, PF_PixelFormat fmt) {
+    const A_long out_w = output->width;
+    const A_long out_h = output->height;
+    const half* src = px.argb.data();
+
+    for (A_long y = 0; y < out_h; ++y) {
+        char* row = reinterpret_cast<char*>(output->data) + y * output->rowbytes;
+        int src_y = rowmap[y];
+        const half* src_row = (src_y >= 0)
+            ? src + static_cast<size_t>(src_y) * px.width * 4 : nullptr;
+
+        for (A_long x = 0; x < out_w; ++x) {
+            float fa = 0, fr = 0, fg = 0, fb_ = 0;
+            if (src_row && col[x] >= 0) {
+                const half* p = src_row + static_cast<size_t>(col[x]) * 4;
+                fa  = static_cast<float>(p[0]);
+                fr  = static_cast<float>(p[1]);
+                fg  = static_cast<float>(p[2]);
+                fb_ = static_cast<float>(p[3]);
+                ApplyAdjust(fr, fg, fb_, fa, black, white, unmult);
+            }
+
+            switch (fmt) {
+                case PF_PixelFormat_ARGB128: {
+                    PF_PixelFloat* po = reinterpret_cast<PF_PixelFloat*>(row) + x;
+                    po->alpha = fa; po->red = fr; po->green = fg; po->blue = fb_;
+                    break;
+                }
+                case PF_PixelFormat_ARGB64: {
+                    PF_Pixel16* po = reinterpret_cast<PF_Pixel16*>(row) + x;
+                    po->alpha = ClampTo16(fa);
+                    po->red   = ClampTo16(fr);
+                    po->green = ClampTo16(fg);
+                    po->blue  = ClampTo16(fb_);
+                    break;
+                }
+                default: {
+                    PF_Pixel8* po = reinterpret_cast<PF_Pixel8*>(row) + x;
+                    po->alpha = ClampTo8(fa);
+                    po->red   = ClampTo8(fr);
+                    po->green = ClampTo8(fg);
+                    po->blue  = ClampTo8(fb_);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+exrdemux::PassChannels PassChannelsFor(const LayerLocation& loc) {
+    exrdemux::PassChannels ch;
+    ch.part_idx = loc.part_idx;
+    ch.r_name = loc.r_name; ch.has_r = loc.has_r;
+    ch.g_name = loc.g_name; ch.has_g = loc.has_g;
+    ch.b_name = loc.b_name; ch.has_b = loc.has_b;
+    ch.a_name = loc.a_name; ch.has_a = loc.has_a;
+    return ch;
+}
 
 // Core EXR-to-output render. Reads the (resolved) layer's R/G/B/A
 // scanlines, applies adjustments, writes to the output world in its
@@ -714,6 +790,39 @@ PF_Err RenderExrLayer(const std::string& path,
         if (loc_it == meta.locations.end()) { FillBlack(output, fmt); return PF_Err_NONE; }
         const LayerLocation& loc = loc_it->second;
         if (loc.part_idx < 0) { FillBlack(output, fmt); return PF_Err_NONE; }
+
+        // Shared decoded copy first: one decode per (file version, pass) for
+        // every layer and frame. Falls through to the per-render decode below
+        // when the file is changing or the cache is off.
+        exrdemux::PassResult cache_result;
+        std::string cache_err;
+        if (auto px = exrdemux::AcquirePass(path, layer_name, PassChannelsFor(loc),
+                                            &cache_result, &cache_err)) {
+            auto t_got = clock::now();
+            std::vector<int> col = SourceIndexMap(output->width, place.origin_x,
+                                                  place.scale_x, px->offset_x, px->width);
+            std::vector<int> rowmap = SourceIndexMap(output->height, place.origin_y,
+                                                     place.scale_y, px->offset_y, px->height);
+            WritePassToOutput(*px, col, rowmap, black, white, unmult, output, fmt);
+            if (timings) {
+                auto us = [](clock::time_point a, clock::time_point b) {
+                    return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                };
+                timings->src_w = px->width; timings->src_h = px->height;
+                timings->open_us    = 0;
+                timings->read_us    = us(t_start, t_got);
+                timings->convert_us = us(t_got, clock::now());
+                timings->cached     = true;
+            }
+            return PF_Err_NONE;
+        }
+        if (cache_result == exrdemux::PassResult::kDecodeError) {
+            // Same outcome as the decode below throwing, without re-decoding
+            // a file we already know this OpenEXR can't read.
+            if (decoder_error_out) *decoder_error_out = cache_err;
+            FillBlack(output, fmt);
+            return PF_Err_NONE;
+        }
 
         Imf::MultiPartInputFile file(path.c_str());
         auto t_opened = clock::now();
@@ -985,6 +1094,87 @@ PF_Err RenderViaChannelSuiteEntries(
 // the unusual code paths (staleness mismatch, decoder-error fallback).
 void LogEvent(const std::string& message);
 
+// EXRDEMUX_CACHE_VERIFY=1: for each (file version, pass) served from the
+// cache on the suite path, also check out AE's chunk once and compare every
+// float bit for bit against the cached pixels. Result goes to the desktop
+// log. This is the in-AE proof that the cache matches what AE would have
+// handed us; off by default.
+void VerifyCachedPassAgainstSuite(PF_InData* in_data, PF_OutData* out_data,
+                                  const ChannelEntry& entry,
+                                  const exrdemux::PassPixels& px,
+                                  const std::string& path,
+                                  const std::string& layer) {
+    const char* opt_in = std::getenv("EXRDEMUX_CACHE_VERIFY");
+    if (!opt_in || opt_in[0] == '\0') return;
+
+    static std::mutex verified_mutex;
+    static std::set<const exrdemux::PassPixels*> verified;
+    {
+        std::lock_guard<std::mutex> lock(verified_mutex);
+        if (!verified.insert(&px).second) return;
+    }
+
+    PF_ChannelSuite1* cs = nullptr;
+    if (AEFX_AcquireSuite(in_data, out_data, kPFChannelSuite1,
+                          kPFChannelSuiteVersion1, "channel suite",
+                          reinterpret_cast<void**>(&cs)) != PF_Err_NONE || !cs) {
+        return;
+    }
+    PF_ChannelChunk chunk;
+    std::memset(&chunk, 0, sizeof(chunk));
+    PF_ChannelRef ref = entry.ref;
+    PF_Err err = cs->PF_CheckoutLayerChannel(
+        in_data->effect_ref, &ref,
+        in_data->current_time, in_data->time_step, in_data->time_scale,
+        PF_DataType_FLOAT, &chunk);
+
+    std::string msg = "Cache-verify  layer=" + layer + "  path=" + path;
+    if (err != PF_Err_NONE || !chunk.dataPV || chunk.dimensionL != 4 ||
+        chunk.data_type != PF_DataType_FLOAT) {
+        msg += "  checkout failed";
+    } else if (chunk.widthL != px.width || chunk.heightL != px.height) {
+        msg += "  MISMATCH dims suite=" + std::to_string(chunk.widthL) + "x" +
+               std::to_string(chunk.heightL) + " cache=" +
+               std::to_string(px.width) + "x" + std::to_string(px.height);
+    } else {
+        long long diffs = 0;
+        long first_x = -1, first_y = -1;
+        float s4[4] = {0}, c4[4] = {0};
+        for (A_long y = 0; y < chunk.heightL; ++y) {
+            const float* srow = reinterpret_cast<const float*>(
+                reinterpret_cast<const char*>(chunk.dataPV) + y * chunk.row_bytesL);
+            const half* crow = px.argb.data() + static_cast<size_t>(y) * px.width * 4;
+            for (A_long i = 0; i < chunk.widthL * 4; ++i) {
+                float c = static_cast<float>(crow[i]);
+                if (std::memcmp(&c, &srow[i], sizeof(float)) != 0) {
+                    if (diffs++ == 0) {
+                        first_x = i / 4; first_y = y;
+                        for (int k = 0; k < 4; ++k) {
+                            s4[k] = srow[(i / 4) * 4 + k];
+                            c4[k] = static_cast<float>(crow[(i / 4) * 4 + k]);
+                        }
+                    }
+                }
+            }
+        }
+        char buf[256];
+        if (diffs == 0) {
+            std::snprintf(buf, sizeof(buf), "  OK %ldx%ld bit-identical",
+                          (long)chunk.widthL, (long)chunk.heightL);
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                "  MISMATCH %lld floats differ; first at %ld,%ld suite ARGB=%g,%g,%g,%g cache=%g,%g,%g,%g",
+                diffs, first_x, first_y, s4[0], s4[1], s4[2], s4[3],
+                c4[0], c4[1], c4[2], c4[3]);
+        }
+        msg += buf;
+    }
+    if (chunk.dataPV) cs->PF_CheckinLayerChannel(in_data->effect_ref, &ref, &chunk);
+    AEFX_ReleaseSuite(in_data, out_data, kPFChannelSuite1,
+                      kPFChannelSuiteVersion1, "channel suite");
+    LogEvent(msg);
+}
+
 // Top-level render dispatcher. Picks between the fast channel-suite path and
 // the slow file-direct path based on whether AE's importer agrees with the
 // EXR file on disk. After an in-place re-render AE's channel suite holds a
@@ -1026,11 +1216,43 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
 
     if (fresh && in_suite) {
         if (path_kind_out) *path_kind_out = "suite";
-        if (layer_out) {
-            for (const auto& e : entries) {
-                if (HashLayerName(e.display_name) == hash) {
-                    *layer_out = e.display_name; break;
+        const ChannelEntry* picked = nullptr;
+        for (const auto& e : entries) {
+            if (HashLayerName(e.display_name) == hash) { picked = &e; break; }
+        }
+        if (layer_out && picked) *layer_out = picked->display_name;
+
+        // Shared decoded copy instead of checking out AE's full-frame float
+        // chunk per layer. Only where it provably equals that chunk: full
+        // resolution (AE downsamples the chunk itself otherwise), all-HALF
+        // channels (half -> float is exact), and no data-window offset.
+        auto loc_it = meta.locations.find(picked ? picked->display_name : std::string());
+        if (picked && loc_it != meta.locations.end() &&
+            loc_it->second.all_half && loc_it->second.data_is_display &&
+            place.scale_x == 1.0 && place.scale_y == 1.0) {
+            using clock = std::chrono::high_resolution_clock;
+            auto t0 = clock::now();
+            if (auto px = exrdemux::AcquirePass(path, loc_it->first,
+                                                PassChannelsFor(loc_it->second))) {
+                auto t1 = clock::now();
+                std::vector<int> col = SourceIndexMap(output->width, place.origin_x,
+                                                      1.0, 0, px->width);
+                std::vector<int> rowmap = SourceIndexMap(output->height, place.origin_y,
+                                                         1.0, 0, px->height);
+                WritePassToOutput(*px, col, rowmap, black, white, unmult, output, fmt);
+                if (timings) {
+                    auto us = [](clock::time_point a, clock::time_point b) {
+                        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                    };
+                    timings->src_w = px->width; timings->src_h = px->height;
+                    timings->read_us    = us(t0, t1);
+                    timings->convert_us = us(t1, clock::now());
+                    timings->cached     = true;
                 }
+                if (path_kind_out) *path_kind_out = "suite-cache";
+                VerifyCachedPassAgainstSuite(in_data, out_data, *picked, *px,
+                                             path, loc_it->first);
+                return PF_Err_NONE;
             }
         }
         return RenderViaChannelSuiteEntries(in_data, out_data, entries,
@@ -1076,7 +1298,7 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
     PF_Err err = RenderExrLayer(path, layer, black, white, unmult,
                                 output, fmt, place, timings, &decoder_err);
     if (decoder_err.empty()) {
-        if (path_kind_out) *path_kind_out = "file";
+        if (path_kind_out) *path_kind_out = (timings && timings->cached) ? "file-cache" : "file";
         if (layer_out) *layer_out = layer;
         return err;
     }
