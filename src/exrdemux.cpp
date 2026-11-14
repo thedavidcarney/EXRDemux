@@ -81,7 +81,7 @@
 
 #define EXRDEMUX_MAJOR_VERSION 0
 #define EXRDEMUX_MINOR_VERSION 9
-#define EXRDEMUX_BUG_VERSION   0
+#define EXRDEMUX_BUG_VERSION   1
 #define EXRDEMUX_STAGE_VERSION PF_Stage_RELEASE
 #define EXRDEMUX_BUILD_VERSION 1
 
@@ -89,7 +89,7 @@
 // of the Effect Controls panel. MUST be bumped on every release. See
 // CLAUDE.md "Release checklist" — this and the version macros above plus
 // AE_Effect_Version in exrdemux.r move together.
-#define EXRDEMUX_VERSION_STRING "v0.9.0"
+#define EXRDEMUX_VERSION_STRING "v0.9.1"
 
 namespace {
 
@@ -446,13 +446,46 @@ std::vector<ChannelEntry> EnumerateChannelSuiteLayers(
 
 // ===== EXR rendering (channel-suite path) =========================
 
+// How a layer's output R/G/B/A is built from the file's channels.
+//   Rgba — the usual name.R/G/B/A (any subset; missing = 0, A = 1).
+//   Uv   — UV coordinates: R=U, G=V, B=A (1 if absent), A=1. Either
+//          one layer with .U/.V[/.A] (render-result naming) or a *virtual*
+//          layer "<P>" assembled from single-channel layers <P>_U, <P>_V
+//          [, <P>_A] (Blender File Output FLOAT items, channel "<P>_U.V").
+//   Grey — any layer holding exactly one non-RGBA channel (e.g. "Mist.V"):
+//          R=G=B=value, A=1.
+// Uv/Grey layers never come from AE's channel suite (it only surfaces
+// 4-channel ARGB chunks), so they always render file-direct, at float
+// precision when the file stores float, with no colour conversion.
+enum class LayerKind { Rgba, Uv, Grey };
+
+// One output channel's source in the file. part < 0 = not in the file;
+// the output uses LayerLocation::defaults[] instead.
+struct ChannelSource {
+    std::string name;
+    int  part     = -1;
+    bool is_float = false;
+};
+
 // Where in the EXR each of the layer's R/G/B/A channels lives. For
-// multipart files all four typically share one part.
+// multipart files all four typically share one part; virtual UV layers
+// pull from one part per component.
 struct LayerLocation {
     int part_idx = -1;
     std::string r_name, g_name, b_name, a_name;
     bool has_r = false, has_g = false, has_b = false, has_a = false;
+
+    LayerKind     kind = LayerKind::Rgba;
+    bool          is_virtual = false;   // not a channel prefix in the file
+    ChannelSource src[4];               // output R, G, B, A
+    float         defaults[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 };
+
+// True for the layers AE's channel suite can surface (R+G+B+A chunks).
+inline bool IsSuiteLayer(const LayerLocation& loc) {
+    return loc.kind == LayerKind::Rgba &&
+           loc.has_r && loc.has_g && loc.has_b && loc.has_a;
+}
 
 // Cached per-file metadata so repeated renders / UI redraws don't re-parse
 // the EXR header and re-iterate every channel of every part.
@@ -513,6 +546,10 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
     try {
         Imf::MultiPartInputFile file(path.c_str());
 
+        // Every channel of each layer, first occurrence wins (suffix ->
+        // source). Used below to classify Uv / Grey layers.
+        std::map<std::string, std::vector<std::pair<std::string, ChannelSource>>> chans;
+
         std::set<std::string> seen;
         bool has_default = false;
         for (int p = 0; p < file.parts(); ++p) {
@@ -532,6 +569,17 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
                     meta.locations[layer].part_idx = p;
                 }
 
+                auto& lc = chans[layer];
+                bool dup = false;
+                for (const auto& sc : lc) if (sc.first == suffix) { dup = true; break; }
+                if (!dup) {
+                    ChannelSource cs;
+                    cs.name = ch_name;
+                    cs.part = p;
+                    cs.is_float = (it.channel().type == Imf::FLOAT);
+                    lc.emplace_back(suffix, cs);
+                }
+
                 LayerLocation& loc = meta.locations[layer];
                 // Cryptomattes (and some other non-color channels) use
                 // lowercase r/g/b/a per OpenEXR convention. AE's channel
@@ -545,6 +593,63 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
                 else if (suffix == "A" || suffix == "a") { loc.a_name = ch_name; loc.has_a = true; }
             }
         }
+
+        // Classify non-colour layers. RGBA layers keep the original
+        // handling exactly (has_* flags + r/g/b/a names above).
+        auto find_sfx = [](const std::vector<std::pair<std::string, ChannelSource>>& lc,
+                           const char* s) -> const ChannelSource* {
+            for (const auto& sc : lc) if (sc.first == s) return &sc.second;
+            return nullptr;
+        };
+        for (auto& kv : chans) {
+            LayerLocation& loc = meta.locations[kv.first];
+            const auto& lc = kv.second;
+            if (loc.has_r || loc.has_g || loc.has_b) continue;  // colour layer
+            const ChannelSource* u = find_sfx(lc, "U");
+            const ChannelSource* v = find_sfx(lc, "V");
+            if (u && v) {
+                // Render-result naming: <P>.U / <P>.V / <P>.A
+                loc.kind = LayerKind::Uv;
+                loc.src[0] = *u;
+                loc.src[1] = *v;
+                if (const ChannelSource* a = find_sfx(lc, "A")) loc.src[2] = *a;
+                loc.defaults[2] = 1.0f;
+            } else if (lc.size() == 1 && !loc.has_a) {
+                loc.kind = LayerKind::Grey;
+                loc.src[0] = loc.src[1] = loc.src[2] = lc[0].second;
+            }
+        }
+
+        // Virtual UV layers: <P>_U + <P>_V (+ <P>_A), each a lone channel
+        // (Blender File Output FLOAT items). Listed just before <P>_U.
+        auto lone = [&](const std::string& name) -> const ChannelSource* {
+            auto it = meta.locations.find(name);
+            if (it == meta.locations.end() || it->second.kind != LayerKind::Grey)
+                return nullptr;
+            return &it->second.src[0];
+        };
+        for (size_t i = 0; i < meta.layers.size(); ++i) {
+            const std::string& name = meta.layers[i];
+            if (name.size() <= 2 || name.compare(name.size() - 2, 2, "_U") != 0)
+                continue;
+            std::string base = name.substr(0, name.size() - 2);
+            if (meta.locations.count(base)) continue;  // real layer wins
+            const ChannelSource* u = lone(name);
+            const ChannelSource* v = lone(base + "_V");
+            if (!u || !v) continue;
+            LayerLocation vl;
+            vl.kind = LayerKind::Uv;
+            vl.is_virtual = true;
+            vl.part_idx = u->part;
+            vl.src[0] = *u;
+            vl.src[1] = *v;
+            if (const ChannelSource* a = lone(base + "_A")) vl.src[2] = *a;
+            vl.defaults[2] = 1.0f;
+            meta.locations[base] = vl;
+            meta.layers.insert(meta.layers.begin() + i, base);
+            ++i;  // skip past <P>_U, now at i+1
+        }
+
         if (has_default) {
             meta.layers.insert(meta.layers.begin(), "(default)");
         }
@@ -687,6 +792,113 @@ struct RenderTimings {
     long src_w = 0, src_h = 0;   // source pixels we sampled from
 };
 
+// File-direct render for Uv / Grey layers. Each distinct source channel is
+// decoded once into a FLOAT buffer (exact for float32 files; no half
+// rounding of UV coordinates), possibly from several parts, then mapped to
+// output R/G/B/A with per-channel defaults. Values pass through raw: no
+// colour conversion. 8/16 bpc outputs clamp to the format's 0..1 range as
+// usual; inside 0..1 a 16 bpc result is within 1/65536 of the file value.
+// Throws on decoder errors (caller's catch handles them).
+void RenderNonRgbaLayer(Imf::MultiPartInputFile& file,
+                        const LayerLocation& loc,
+                        double black, double white, bool unmult,
+                        PF_EffectWorld* output, PF_PixelFormat fmt,
+                        const OutputPlacement& place,
+                        RenderTimings* timings) {
+    const ChannelSource& lead = loc.src[0];
+    if (lead.part < 0 || lead.part >= file.parts()) { FillBlack(output, fmt); return; }
+
+    const Imf::Header& header = file.header(lead.part);
+    Imath::Box2i dw = header.dataWindow();
+    Imath::Box2i disp = header.displayWindow();
+    int w = dw.max.x - dw.min.x + 1;
+    int h = dw.max.y - dw.min.y + 1;
+    if (w <= 0 || h <= 0) { FillBlack(output, fmt); return; }
+    if (timings) { timings->src_w = w; timings->src_h = h; }
+    const size_t npx = static_cast<size_t>(w) * h;
+
+    // Distinct sources -> buffers. slot[c] = buffer index for output c.
+    std::vector<std::vector<float>> bufs;
+    std::vector<const ChannelSource*> owners;
+    int slot[4] = {-1, -1, -1, -1};
+    for (int c = 0; c < 4; ++c) {
+        const ChannelSource& s = loc.src[c];
+        if (s.part < 0 || s.part >= file.parts()) continue;
+        if (file.header(s.part).dataWindow() != dw) continue;  // can't align
+        for (size_t k = 0; k < owners.size(); ++k) {
+            if (owners[k]->part == s.part && owners[k]->name == s.name) {
+                slot[c] = static_cast<int>(k); break;
+            }
+        }
+        if (slot[c] < 0) {
+            slot[c] = static_cast<int>(owners.size());
+            owners.push_back(&s);
+            bufs.emplace_back(npx, 0.0f);
+        }
+    }
+
+    // One read per part touched.
+    std::set<int> parts;
+    for (const ChannelSource* o : owners) parts.insert(o->part);
+    for (int p : parts) {
+        Imf::FrameBuffer fb;
+        for (size_t k = 0; k < owners.size(); ++k) {
+            if (owners[k]->part != p) continue;
+            char* base = reinterpret_cast<char*>(bufs[k].data())
+                       - (static_cast<ptrdiff_t>(dw.min.x) +
+                          static_cast<ptrdiff_t>(dw.min.y) * w) * sizeof(float);
+            fb.insert(owners[k]->name.c_str(),
+                Imf::Slice(Imf::FLOAT, base, sizeof(float),
+                           sizeof(float) * static_cast<size_t>(w)));
+        }
+        Imf::InputPart input(file, p);
+        input.setFrameBuffer(fb);
+        input.readPixels(dw.min.y, dw.max.y);
+    }
+
+    const float* srcp[4];
+    for (int c = 0; c < 4; ++c) srcp[c] = slot[c] >= 0 ? bufs[slot[c]].data() : nullptr;
+
+    A_long out_w = output->width;
+    A_long out_h = output->height;
+    std::vector<int> col = SourceIndexMap(out_w, place.origin_x, place.scale_x,
+                                          dw.min.x - disp.min.x, w);
+    std::vector<int> rowmap = SourceIndexMap(out_h, place.origin_y, place.scale_y,
+                                             dw.min.y - disp.min.y, h);
+    for (A_long y = 0; y < out_h; ++y) {
+        char* row = reinterpret_cast<char*>(output->data) + y * output->rowbytes;
+        int src_y = rowmap[y];
+        for (A_long x = 0; x < out_w; ++x) {
+            int src_x = col[x];
+            float v[4] = {0, 0, 0, 0};
+            if (src_y >= 0 && src_x >= 0) {
+                size_t i = static_cast<size_t>(src_y) * w + src_x;
+                for (int c = 0; c < 4; ++c) v[c] = srcp[c] ? srcp[c][i] : loc.defaults[c];
+                ApplyAdjust(v[0], v[1], v[2], v[3], black, white, unmult);
+            }
+            switch (fmt) {
+                case PF_PixelFormat_ARGB128: {
+                    PF_PixelFloat* p = reinterpret_cast<PF_PixelFloat*>(row) + x;
+                    p->alpha = v[3]; p->red = v[0]; p->green = v[1]; p->blue = v[2];
+                    break;
+                }
+                case PF_PixelFormat_ARGB64: {
+                    PF_Pixel16* p = reinterpret_cast<PF_Pixel16*>(row) + x;
+                    p->alpha = ClampTo16(v[3]); p->red  = ClampTo16(v[0]);
+                    p->green = ClampTo16(v[1]); p->blue = ClampTo16(v[2]);
+                    break;
+                }
+                default: {
+                    PF_Pixel8* p = reinterpret_cast<PF_Pixel8*>(row) + x;
+                    p->alpha = ClampTo8(v[3]); p->red  = ClampTo8(v[0]);
+                    p->green = ClampTo8(v[1]); p->blue = ClampTo8(v[2]);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 // Core EXR-to-output render. Reads the (resolved) layer's R/G/B/A
 // scanlines, applies adjustments, writes to the output world in its
 // native pixel format.
@@ -717,6 +929,19 @@ PF_Err RenderExrLayer(const std::string& path,
 
         Imf::MultiPartInputFile file(path.c_str());
         auto t_opened = clock::now();
+
+        if (loc.kind != LayerKind::Rgba) {
+            RenderNonRgbaLayer(file, loc, black, white, unmult,
+                               output, fmt, place, timings);
+            if (timings) {
+                auto us = [](clock::time_point a, clock::time_point b) {
+                    return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                };
+                timings->open_us = us(t_start, t_opened);
+                timings->read_us = us(t_opened, clock::now());  // read + convert
+            }
+            return PF_Err_NONE;
+        }
 
         const Imf::Header& header = file.header(loc.part_idx);
         Imath::Box2i dw = header.dataWindow();
@@ -841,15 +1066,20 @@ PF_Err RenderExrLayer(const std::string& path,
 // passes (Blender's per-light AOVs, denoising AOVs, etc.).
 bool ChannelSuiteMatchesFile(const std::vector<ChannelEntry>& suite,
                               const ExrMetadata& file_meta) {
+    // A render-result UV layer (<P>.U/.V/.A) has an alpha, so AE may list it;
+    // we never render Uv/Grey layers from the suite, so ignore such entries
+    // rather than calling the whole suite stale.
     std::set<std::string> suite_names;
-    for (const auto& e : suite) suite_names.insert(e.display_name);
+    for (const auto& e : suite) {
+        auto it = file_meta.locations.find(e.display_name);
+        if (it != file_meta.locations.end() && it->second.kind != LayerKind::Rgba)
+            continue;
+        suite_names.insert(e.display_name);
+    }
 
     std::set<std::string> file_names;
     for (const auto& kv : file_meta.locations) {
-        const LayerLocation& loc = kv.second;
-        if (loc.has_r && loc.has_g && loc.has_b && loc.has_a) {
-            file_names.insert(kv.first);
-        }
+        if (IsSuiteLayer(kv.second)) file_names.insert(kv.first);
     }
     return suite_names == file_names;
 }
@@ -1022,6 +1252,13 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
     bool in_suite = false;
     for (const auto& e : entries) {
         if (HashLayerName(e.display_name) == hash) { in_suite = true; break; }
+    }
+    // Uv / Grey (incl. virtual UV) layers are file-direct only.
+    {
+        std::string picked = ResolveLayerByHash(meta, hash);
+        auto it = meta.locations.find(picked);
+        if (it != meta.locations.end() && it->second.kind != LayerKind::Rgba)
+            in_suite = false;
     }
 
     if (fresh && in_suite) {
@@ -1355,7 +1592,9 @@ PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
     // channel suite path; ordering doesn't matter there.)
     std::string path = GetSourceExrPath(in_data, nullptr);
     std::vector<std::string> display_names;
-    if (!path.empty()) display_names = EnumerateExrLayers(path);
+    // Metadata layers = the file's channel prefixes in authoring order, plus
+    // virtual UV layers (e.g. "UV" from UV_U/UV_V/UV_A) placed before <P>_U.
+    if (!path.empty()) display_names = GetExrMetadata(path).layers;
     if (display_names.empty()) return PF_Err_NONE;
 
     int picked = ShowLayerPickerDialog(display_names);
