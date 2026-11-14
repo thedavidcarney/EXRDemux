@@ -53,10 +53,10 @@ resource 'PiPL' (16000) {
         // | (stage<<9) | build.  Stage: DEVELOP=0, ALPHA=1, BETA=2, RELEASE=3.
         // Must match the runtime PF_VERSION(...) call in exrdemux.cpp or AE
         // refuses to load with "code/PiPL version mismatch".
-        // Current: 0.9.0 release build 1  =>  (9<<15) | (3<<9) | 1
-        //          =>  0x48601 = 296449.
+        // Current: 0.9.1 release build 1  =>  (9<<15) | (1<<11) | (3<<9) | 1
+        //          =>  0x48E01 = 298497.
         AE_Effect_Version {
-            0x48601
+            0x48E01
         },
 
         AE_Effect_Info_Flags {

@@ -50,6 +50,7 @@
 #include "AEGP_SuiteHandler.h"
 
 #include "exrdemux_dialog.h"
+#include "exrdemux_pass_cache.h"
 
 #include <Imath/half.h>
 #include <ImfMultiPartInputFile.h>
@@ -81,7 +82,7 @@
 
 #define EXRDEMUX_MAJOR_VERSION 0
 #define EXRDEMUX_MINOR_VERSION 9
-#define EXRDEMUX_BUG_VERSION   0
+#define EXRDEMUX_BUG_VERSION   1
 #define EXRDEMUX_STAGE_VERSION PF_Stage_RELEASE
 #define EXRDEMUX_BUILD_VERSION 1
 
@@ -89,7 +90,7 @@
 // of the Effect Controls panel. MUST be bumped on every release. See
 // CLAUDE.md "Release checklist" — this and the version macros above plus
 // AE_Effect_Version in exrdemux.r move together.
-#define EXRDEMUX_VERSION_STRING "v0.9.0"
+#define EXRDEMUX_VERSION_STRING "v0.9.1"
 
 namespace {
 
@@ -446,13 +447,48 @@ std::vector<ChannelEntry> EnumerateChannelSuiteLayers(
 
 // ===== EXR rendering (channel-suite path) =========================
 
+// How a layer's output R/G/B/A is built from the file's channels.
+//   Rgba — the usual name.R/G/B/A (any subset; missing = 0, A = 1).
+//   Uv   — UV coordinates: R=U, G=V, B=A (1 if absent), A=1. Either
+//          one layer with .U/.V[/.A] (render-result naming) or a *virtual*
+//          layer "<P>" assembled from single-channel layers <P>_U, <P>_V
+//          [, <P>_A] (Blender File Output FLOAT items, channel "<P>_U.V").
+//   Grey — any layer holding exactly one non-RGBA channel (e.g. "Mist.V"):
+//          R=G=B=value, A=1.
+// Uv/Grey layers never come from AE's channel suite (it only surfaces
+// 4-channel ARGB chunks), so they always render file-direct, at float
+// precision when the file stores float, with no colour conversion.
+enum class LayerKind { Rgba, Uv, Grey };
+
+// One output channel's source in the file. part < 0 = not in the file;
+// the output uses LayerLocation::defaults[] instead.
+struct ChannelSource {
+    std::string name;
+    int  part     = -1;
+    bool is_float = false;
+};
+
 // Where in the EXR each of the layer's R/G/B/A channels lives. For
-// multipart files all four typically share one part.
+// multipart files all four typically share one part; virtual UV layers
+// pull from one part per component.
 struct LayerLocation {
     int part_idx = -1;
     std::string r_name, g_name, b_name, a_name;
     bool has_r = false, has_g = false, has_b = false, has_a = false;
+
+    LayerKind     kind = LayerKind::Rgba;
+    bool          is_virtual = false;   // not a channel prefix in the file
+    ChannelSource src[4];               // output R, G, B, A
+    float         defaults[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    bool all_half = true;          // every R/G/B/A channel is stored as HALF
+    bool data_is_display = false;  // part's data window == display window
 };
+
+// True for the layers AE's channel suite can surface (R+G+B+A chunks).
+inline bool IsSuiteLayer(const LayerLocation& loc) {
+    return loc.kind == LayerKind::Rgba &&
+           loc.has_r && loc.has_g && loc.has_b && loc.has_a;
+}
 
 // Cached per-file metadata so repeated renders / UI redraws don't re-parse
 // the EXR header and re-iterate every channel of every part.
@@ -513,6 +549,10 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
     try {
         Imf::MultiPartInputFile file(path.c_str());
 
+        // Every channel of each layer, first occurrence wins (suffix ->
+        // source). Used below to classify Uv / Grey layers.
+        std::map<std::string, std::vector<std::pair<std::string, ChannelSource>>> chans;
+
         std::set<std::string> seen;
         bool has_default = false;
         for (int p = 0; p < file.parts(); ++p) {
@@ -529,7 +569,21 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
 
                 if (seen.insert(layer).second) {
                     meta.layers.push_back(layer);
-                    meta.locations[layer].part_idx = p;
+                    LayerLocation& first = meta.locations[layer];
+                    first.part_idx = p;
+                    first.data_is_display =
+                        file.header(p).dataWindow() == file.header(p).displayWindow();
+                }
+
+                auto& lc = chans[layer];
+                bool dup = false;
+                for (const auto& sc : lc) if (sc.first == suffix) { dup = true; break; }
+                if (!dup) {
+                    ChannelSource cs;
+                    cs.name = ch_name;
+                    cs.part = p;
+                    cs.is_float = (it.channel().type == Imf::FLOAT);
+                    lc.emplace_back(suffix, cs);
                 }
 
                 LayerLocation& loc = meta.locations[layer];
@@ -543,8 +597,67 @@ ExrMetadata BuildExrMetadata(const std::string& path) {
                 else if (suffix == "G" || suffix == "g") { loc.g_name = ch_name; loc.has_g = true; }
                 else if (suffix == "B" || suffix == "b") { loc.b_name = ch_name; loc.has_b = true; }
                 else if (suffix == "A" || suffix == "a") { loc.a_name = ch_name; loc.has_a = true; }
+                else continue;
+                if (it.channel().type != Imf::HALF) loc.all_half = false;
             }
         }
+
+        // Classify non-colour layers. RGBA layers keep the original
+        // handling exactly (has_* flags + r/g/b/a names above).
+        auto find_sfx = [](const std::vector<std::pair<std::string, ChannelSource>>& lc,
+                           const char* s) -> const ChannelSource* {
+            for (const auto& sc : lc) if (sc.first == s) return &sc.second;
+            return nullptr;
+        };
+        for (auto& kv : chans) {
+            LayerLocation& loc = meta.locations[kv.first];
+            const auto& lc = kv.second;
+            if (loc.has_r || loc.has_g || loc.has_b) continue;  // colour layer
+            const ChannelSource* u = find_sfx(lc, "U");
+            const ChannelSource* v = find_sfx(lc, "V");
+            if (u && v) {
+                // Render-result naming: <P>.U / <P>.V / <P>.A
+                loc.kind = LayerKind::Uv;
+                loc.src[0] = *u;
+                loc.src[1] = *v;
+                if (const ChannelSource* a = find_sfx(lc, "A")) loc.src[2] = *a;
+                loc.defaults[2] = 1.0f;
+            } else if (lc.size() == 1 && !loc.has_a) {
+                loc.kind = LayerKind::Grey;
+                loc.src[0] = loc.src[1] = loc.src[2] = lc[0].second;
+            }
+        }
+
+        // Virtual UV layers: <P>_U + <P>_V (+ <P>_A), each a lone channel
+        // (Blender File Output FLOAT items). Listed just before <P>_U.
+        auto lone = [&](const std::string& name) -> const ChannelSource* {
+            auto it = meta.locations.find(name);
+            if (it == meta.locations.end() || it->second.kind != LayerKind::Grey)
+                return nullptr;
+            return &it->second.src[0];
+        };
+        for (size_t i = 0; i < meta.layers.size(); ++i) {
+            const std::string& name = meta.layers[i];
+            if (name.size() <= 2 || name.compare(name.size() - 2, 2, "_U") != 0)
+                continue;
+            std::string base = name.substr(0, name.size() - 2);
+            if (meta.locations.count(base)) continue;  // real layer wins
+            const ChannelSource* u = lone(name);
+            const ChannelSource* v = lone(base + "_V");
+            if (!u || !v) continue;
+            LayerLocation vl;
+            vl.kind = LayerKind::Uv;
+            vl.is_virtual = true;
+            vl.part_idx = u->part;
+            vl.src[0] = *u;
+            vl.src[1] = *v;
+            if (const ChannelSource* a = lone(base + "_A")) vl.src[2] = *a;
+            vl.defaults[2] = 1.0f;
+            meta.locations[base] = vl;
+            meta.layers.insert(meta.layers.begin() + i, base);
+            ++i;  // skip past <P>_U, now at i+1
+        }
+
         if (has_default) {
             meta.layers.insert(meta.layers.begin(), "(default)");
         }
@@ -685,7 +798,182 @@ struct RenderTimings {
     long long read_us = 0;
     long long convert_us = 0;
     long src_w = 0, src_h = 0;   // source pixels we sampled from
+    bool cached = false;         // served from the shared pass cache
 };
+
+// File-direct render for Uv / Grey layers. Each distinct source channel is
+// decoded once into a FLOAT buffer (exact for float32 files; no half
+// rounding of UV coordinates), possibly from several parts, then mapped to
+// output R/G/B/A with per-channel defaults. Values pass through raw: no
+// colour conversion. 8/16 bpc outputs clamp to the format's 0..1 range as
+// usual; inside 0..1 a 16 bpc result is within 1/65536 of the file value.
+// Throws on decoder errors (caller's catch handles them).
+void RenderNonRgbaLayer(Imf::MultiPartInputFile& file,
+                        const LayerLocation& loc,
+                        double black, double white, bool unmult,
+                        PF_EffectWorld* output, PF_PixelFormat fmt,
+                        const OutputPlacement& place,
+                        RenderTimings* timings) {
+    const ChannelSource& lead = loc.src[0];
+    if (lead.part < 0 || lead.part >= file.parts()) { FillBlack(output, fmt); return; }
+
+    const Imf::Header& header = file.header(lead.part);
+    Imath::Box2i dw = header.dataWindow();
+    Imath::Box2i disp = header.displayWindow();
+    int w = dw.max.x - dw.min.x + 1;
+    int h = dw.max.y - dw.min.y + 1;
+    if (w <= 0 || h <= 0) { FillBlack(output, fmt); return; }
+    if (timings) { timings->src_w = w; timings->src_h = h; }
+    const size_t npx = static_cast<size_t>(w) * h;
+
+    // Distinct sources -> buffers. slot[c] = buffer index for output c.
+    std::vector<std::vector<float>> bufs;
+    std::vector<const ChannelSource*> owners;
+    int slot[4] = {-1, -1, -1, -1};
+    for (int c = 0; c < 4; ++c) {
+        const ChannelSource& s = loc.src[c];
+        if (s.part < 0 || s.part >= file.parts()) continue;
+        if (file.header(s.part).dataWindow() != dw) continue;  // can't align
+        for (size_t k = 0; k < owners.size(); ++k) {
+            if (owners[k]->part == s.part && owners[k]->name == s.name) {
+                slot[c] = static_cast<int>(k); break;
+            }
+        }
+        if (slot[c] < 0) {
+            slot[c] = static_cast<int>(owners.size());
+            owners.push_back(&s);
+            bufs.emplace_back(npx, 0.0f);
+        }
+    }
+
+    // One read per part touched.
+    std::set<int> parts;
+    for (const ChannelSource* o : owners) parts.insert(o->part);
+    for (int p : parts) {
+        Imf::FrameBuffer fb;
+        for (size_t k = 0; k < owners.size(); ++k) {
+            if (owners[k]->part != p) continue;
+            char* base = reinterpret_cast<char*>(bufs[k].data())
+                       - (static_cast<ptrdiff_t>(dw.min.x) +
+                          static_cast<ptrdiff_t>(dw.min.y) * w) * sizeof(float);
+            fb.insert(owners[k]->name.c_str(),
+                Imf::Slice(Imf::FLOAT, base, sizeof(float),
+                           sizeof(float) * static_cast<size_t>(w)));
+        }
+        Imf::InputPart input(file, p);
+        input.setFrameBuffer(fb);
+        input.readPixels(dw.min.y, dw.max.y);
+    }
+
+    const float* srcp[4];
+    for (int c = 0; c < 4; ++c) srcp[c] = slot[c] >= 0 ? bufs[slot[c]].data() : nullptr;
+
+    A_long out_w = output->width;
+    A_long out_h = output->height;
+    std::vector<int> col = SourceIndexMap(out_w, place.origin_x, place.scale_x,
+                                          dw.min.x - disp.min.x, w);
+    std::vector<int> rowmap = SourceIndexMap(out_h, place.origin_y, place.scale_y,
+                                             dw.min.y - disp.min.y, h);
+    for (A_long y = 0; y < out_h; ++y) {
+        char* row = reinterpret_cast<char*>(output->data) + y * output->rowbytes;
+        int src_y = rowmap[y];
+        for (A_long x = 0; x < out_w; ++x) {
+            int src_x = col[x];
+            float v[4] = {0, 0, 0, 0};
+            if (src_y >= 0 && src_x >= 0) {
+                size_t i = static_cast<size_t>(src_y) * w + src_x;
+                for (int c = 0; c < 4; ++c) v[c] = srcp[c] ? srcp[c][i] : loc.defaults[c];
+                ApplyAdjust(v[0], v[1], v[2], v[3], black, white, unmult);
+            }
+            switch (fmt) {
+                case PF_PixelFormat_ARGB128: {
+                    PF_PixelFloat* p = reinterpret_cast<PF_PixelFloat*>(row) + x;
+                    p->alpha = v[3]; p->red = v[0]; p->green = v[1]; p->blue = v[2];
+                    break;
+                }
+                case PF_PixelFormat_ARGB64: {
+                    PF_Pixel16* p = reinterpret_cast<PF_Pixel16*>(row) + x;
+                    p->alpha = ClampTo16(v[3]); p->red  = ClampTo16(v[0]);
+                    p->green = ClampTo16(v[1]); p->blue = ClampTo16(v[2]);
+                    break;
+                }
+                default: {
+                    PF_Pixel8* p = reinterpret_cast<PF_Pixel8*>(row) + x;
+                    p->alpha = ClampTo8(v[3]); p->red  = ClampTo8(v[0]);
+                    p->green = ClampTo8(v[1]); p->blue = ClampTo8(v[2]);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Write a cached pass into the output world. `col` / `rowmap` come from
+// SourceIndexMap exactly as the uncached paths build them, and the per-pixel
+// work (half -> float, ApplyAdjust, clamp) is the same, so the output is
+// bit-identical to the uncached render of the same source pixels.
+void WritePassToOutput(const exrdemux::PassPixels& px,
+                       const std::vector<int>& col,
+                       const std::vector<int>& rowmap,
+                       double black, double white, bool unmult,
+                       PF_EffectWorld* output, PF_PixelFormat fmt) {
+    const A_long out_w = output->width;
+    const A_long out_h = output->height;
+    const half* src = px.argb.data();
+
+    for (A_long y = 0; y < out_h; ++y) {
+        char* row = reinterpret_cast<char*>(output->data) + y * output->rowbytes;
+        int src_y = rowmap[y];
+        const half* src_row = (src_y >= 0)
+            ? src + static_cast<size_t>(src_y) * px.width * 4 : nullptr;
+
+        for (A_long x = 0; x < out_w; ++x) {
+            float fa = 0, fr = 0, fg = 0, fb_ = 0;
+            if (src_row && col[x] >= 0) {
+                const half* p = src_row + static_cast<size_t>(col[x]) * 4;
+                fa  = static_cast<float>(p[0]);
+                fr  = static_cast<float>(p[1]);
+                fg  = static_cast<float>(p[2]);
+                fb_ = static_cast<float>(p[3]);
+                ApplyAdjust(fr, fg, fb_, fa, black, white, unmult);
+            }
+
+            switch (fmt) {
+                case PF_PixelFormat_ARGB128: {
+                    PF_PixelFloat* po = reinterpret_cast<PF_PixelFloat*>(row) + x;
+                    po->alpha = fa; po->red = fr; po->green = fg; po->blue = fb_;
+                    break;
+                }
+                case PF_PixelFormat_ARGB64: {
+                    PF_Pixel16* po = reinterpret_cast<PF_Pixel16*>(row) + x;
+                    po->alpha = ClampTo16(fa);
+                    po->red   = ClampTo16(fr);
+                    po->green = ClampTo16(fg);
+                    po->blue  = ClampTo16(fb_);
+                    break;
+                }
+                default: {
+                    PF_Pixel8* po = reinterpret_cast<PF_Pixel8*>(row) + x;
+                    po->alpha = ClampTo8(fa);
+                    po->red   = ClampTo8(fr);
+                    po->green = ClampTo8(fg);
+                    po->blue  = ClampTo8(fb_);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+exrdemux::PassChannels PassChannelsFor(const LayerLocation& loc) {
+    exrdemux::PassChannels ch;
+    ch.part_idx = loc.part_idx;
+    ch.r_name = loc.r_name; ch.has_r = loc.has_r;
+    ch.g_name = loc.g_name; ch.has_g = loc.has_g;
+    ch.b_name = loc.b_name; ch.has_b = loc.has_b;
+    ch.a_name = loc.a_name; ch.has_a = loc.has_a;
+    return ch;
+}
 
 // Core EXR-to-output render. Reads the (resolved) layer's R/G/B/A
 // scanlines, applies adjustments, writes to the output world in its
@@ -714,6 +1002,56 @@ PF_Err RenderExrLayer(const std::string& path,
         if (loc_it == meta.locations.end()) { FillBlack(output, fmt); return PF_Err_NONE; }
         const LayerLocation& loc = loc_it->second;
         if (loc.part_idx < 0) { FillBlack(output, fmt); return PF_Err_NONE; }
+
+        // Uv / Grey layers: float, possibly several parts. The shared pass
+        // cache holds half RGBA only, so these always decode directly.
+        if (loc.kind != LayerKind::Rgba) {
+            Imf::MultiPartInputFile file(path.c_str());
+            auto t_opened = clock::now();
+            RenderNonRgbaLayer(file, loc, black, white, unmult,
+                               output, fmt, place, timings);
+            if (timings) {
+                auto us = [](clock::time_point a, clock::time_point b) {
+                    return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                };
+                timings->open_us = us(t_start, t_opened);
+                timings->read_us = us(t_opened, clock::now());  // read + convert
+            }
+            return PF_Err_NONE;
+        }
+
+        // Shared decoded copy first: one decode per (file version, pass) for
+        // every layer and frame. Falls through to the per-render decode below
+        // when the file is changing or the cache is off.
+        exrdemux::PassResult cache_result;
+        std::string cache_err;
+        if (auto px = exrdemux::AcquirePass(path, layer_name, PassChannelsFor(loc),
+                                            &cache_result, &cache_err)) {
+            auto t_got = clock::now();
+            std::vector<int> col = SourceIndexMap(output->width, place.origin_x,
+                                                  place.scale_x, px->offset_x, px->width);
+            std::vector<int> rowmap = SourceIndexMap(output->height, place.origin_y,
+                                                     place.scale_y, px->offset_y, px->height);
+            WritePassToOutput(*px, col, rowmap, black, white, unmult, output, fmt);
+            if (timings) {
+                auto us = [](clock::time_point a, clock::time_point b) {
+                    return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                };
+                timings->src_w = px->width; timings->src_h = px->height;
+                timings->open_us    = 0;
+                timings->read_us    = us(t_start, t_got);
+                timings->convert_us = us(t_got, clock::now());
+                timings->cached     = true;
+            }
+            return PF_Err_NONE;
+        }
+        if (cache_result == exrdemux::PassResult::kDecodeError) {
+            // Same outcome as the decode below throwing, without re-decoding
+            // a file we already know this OpenEXR can't read.
+            if (decoder_error_out) *decoder_error_out = cache_err;
+            FillBlack(output, fmt);
+            return PF_Err_NONE;
+        }
 
         Imf::MultiPartInputFile file(path.c_str());
         auto t_opened = clock::now();
@@ -841,15 +1179,20 @@ PF_Err RenderExrLayer(const std::string& path,
 // passes (Blender's per-light AOVs, denoising AOVs, etc.).
 bool ChannelSuiteMatchesFile(const std::vector<ChannelEntry>& suite,
                               const ExrMetadata& file_meta) {
+    // A render-result UV layer (<P>.U/.V/.A) has an alpha, so AE may list it;
+    // we never render Uv/Grey layers from the suite, so ignore such entries
+    // rather than calling the whole suite stale.
     std::set<std::string> suite_names;
-    for (const auto& e : suite) suite_names.insert(e.display_name);
+    for (const auto& e : suite) {
+        auto it = file_meta.locations.find(e.display_name);
+        if (it != file_meta.locations.end() && it->second.kind != LayerKind::Rgba)
+            continue;
+        suite_names.insert(e.display_name);
+    }
 
     std::set<std::string> file_names;
     for (const auto& kv : file_meta.locations) {
-        const LayerLocation& loc = kv.second;
-        if (loc.has_r && loc.has_g && loc.has_b && loc.has_a) {
-            file_names.insert(kv.first);
-        }
+        if (IsSuiteLayer(kv.second)) file_names.insert(kv.first);
     }
     return suite_names == file_names;
 }
@@ -985,6 +1328,87 @@ PF_Err RenderViaChannelSuiteEntries(
 // the unusual code paths (staleness mismatch, decoder-error fallback).
 void LogEvent(const std::string& message);
 
+// EXRDEMUX_CACHE_VERIFY=1: for each (file version, pass) served from the
+// cache on the suite path, also check out AE's chunk once and compare every
+// float bit for bit against the cached pixels. Result goes to the desktop
+// log. This is the in-AE proof that the cache matches what AE would have
+// handed us; off by default.
+void VerifyCachedPassAgainstSuite(PF_InData* in_data, PF_OutData* out_data,
+                                  const ChannelEntry& entry,
+                                  const exrdemux::PassPixels& px,
+                                  const std::string& path,
+                                  const std::string& layer) {
+    const char* opt_in = std::getenv("EXRDEMUX_CACHE_VERIFY");
+    if (!opt_in || opt_in[0] == '\0') return;
+
+    static std::mutex verified_mutex;
+    static std::set<const exrdemux::PassPixels*> verified;
+    {
+        std::lock_guard<std::mutex> lock(verified_mutex);
+        if (!verified.insert(&px).second) return;
+    }
+
+    PF_ChannelSuite1* cs = nullptr;
+    if (AEFX_AcquireSuite(in_data, out_data, kPFChannelSuite1,
+                          kPFChannelSuiteVersion1, "channel suite",
+                          reinterpret_cast<void**>(&cs)) != PF_Err_NONE || !cs) {
+        return;
+    }
+    PF_ChannelChunk chunk;
+    std::memset(&chunk, 0, sizeof(chunk));
+    PF_ChannelRef ref = entry.ref;
+    PF_Err err = cs->PF_CheckoutLayerChannel(
+        in_data->effect_ref, &ref,
+        in_data->current_time, in_data->time_step, in_data->time_scale,
+        PF_DataType_FLOAT, &chunk);
+
+    std::string msg = "Cache-verify  layer=" + layer + "  path=" + path;
+    if (err != PF_Err_NONE || !chunk.dataPV || chunk.dimensionL != 4 ||
+        chunk.data_type != PF_DataType_FLOAT) {
+        msg += "  checkout failed";
+    } else if (chunk.widthL != px.width || chunk.heightL != px.height) {
+        msg += "  MISMATCH dims suite=" + std::to_string(chunk.widthL) + "x" +
+               std::to_string(chunk.heightL) + " cache=" +
+               std::to_string(px.width) + "x" + std::to_string(px.height);
+    } else {
+        long long diffs = 0;
+        long first_x = -1, first_y = -1;
+        float s4[4] = {0}, c4[4] = {0};
+        for (A_long y = 0; y < chunk.heightL; ++y) {
+            const float* srow = reinterpret_cast<const float*>(
+                reinterpret_cast<const char*>(chunk.dataPV) + y * chunk.row_bytesL);
+            const half* crow = px.argb.data() + static_cast<size_t>(y) * px.width * 4;
+            for (A_long i = 0; i < chunk.widthL * 4; ++i) {
+                float c = static_cast<float>(crow[i]);
+                if (std::memcmp(&c, &srow[i], sizeof(float)) != 0) {
+                    if (diffs++ == 0) {
+                        first_x = i / 4; first_y = y;
+                        for (int k = 0; k < 4; ++k) {
+                            s4[k] = srow[(i / 4) * 4 + k];
+                            c4[k] = static_cast<float>(crow[(i / 4) * 4 + k]);
+                        }
+                    }
+                }
+            }
+        }
+        char buf[256];
+        if (diffs == 0) {
+            std::snprintf(buf, sizeof(buf), "  OK %ldx%ld bit-identical",
+                          (long)chunk.widthL, (long)chunk.heightL);
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                "  MISMATCH %lld floats differ; first at %ld,%ld suite ARGB=%g,%g,%g,%g cache=%g,%g,%g,%g",
+                diffs, first_x, first_y, s4[0], s4[1], s4[2], s4[3],
+                c4[0], c4[1], c4[2], c4[3]);
+        }
+        msg += buf;
+    }
+    if (chunk.dataPV) cs->PF_CheckinLayerChannel(in_data->effect_ref, &ref, &chunk);
+    AEFX_ReleaseSuite(in_data, out_data, kPFChannelSuite1,
+                      kPFChannelSuiteVersion1, "channel suite");
+    LogEvent(msg);
+}
+
 // Top-level render dispatcher. Picks between the fast channel-suite path and
 // the slow file-direct path based on whether AE's importer agrees with the
 // EXR file on disk. After an in-place re-render AE's channel suite holds a
@@ -1023,14 +1447,53 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
     for (const auto& e : entries) {
         if (HashLayerName(e.display_name) == hash) { in_suite = true; break; }
     }
+    // Uv / Grey (incl. virtual UV) layers are file-direct only.
+    {
+        std::string picked = ResolveLayerByHash(meta, hash);
+        auto it = meta.locations.find(picked);
+        if (it != meta.locations.end() && it->second.kind != LayerKind::Rgba)
+            in_suite = false;
+    }
 
     if (fresh && in_suite) {
         if (path_kind_out) *path_kind_out = "suite";
-        if (layer_out) {
-            for (const auto& e : entries) {
-                if (HashLayerName(e.display_name) == hash) {
-                    *layer_out = e.display_name; break;
+        const ChannelEntry* picked = nullptr;
+        for (const auto& e : entries) {
+            if (HashLayerName(e.display_name) == hash) { picked = &e; break; }
+        }
+        if (layer_out && picked) *layer_out = picked->display_name;
+
+        // Shared decoded copy instead of checking out AE's full-frame float
+        // chunk per layer. Only where it provably equals that chunk: full
+        // resolution (AE downsamples the chunk itself otherwise), all-HALF
+        // channels (half -> float is exact), and no data-window offset.
+        auto loc_it = meta.locations.find(picked ? picked->display_name : std::string());
+        if (picked && loc_it != meta.locations.end() &&
+            loc_it->second.all_half && loc_it->second.data_is_display &&
+            place.scale_x == 1.0 && place.scale_y == 1.0) {
+            using clock = std::chrono::high_resolution_clock;
+            auto t0 = clock::now();
+            if (auto px = exrdemux::AcquirePass(path, loc_it->first,
+                                                PassChannelsFor(loc_it->second))) {
+                auto t1 = clock::now();
+                std::vector<int> col = SourceIndexMap(output->width, place.origin_x,
+                                                      1.0, 0, px->width);
+                std::vector<int> rowmap = SourceIndexMap(output->height, place.origin_y,
+                                                         1.0, 0, px->height);
+                WritePassToOutput(*px, col, rowmap, black, white, unmult, output, fmt);
+                if (timings) {
+                    auto us = [](clock::time_point a, clock::time_point b) {
+                        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                    };
+                    timings->src_w = px->width; timings->src_h = px->height;
+                    timings->read_us    = us(t0, t1);
+                    timings->convert_us = us(t1, clock::now());
+                    timings->cached     = true;
                 }
+                if (path_kind_out) *path_kind_out = "suite-cache";
+                VerifyCachedPassAgainstSuite(in_data, out_data, *picked, *px,
+                                             path, loc_it->first);
+                return PF_Err_NONE;
             }
         }
         return RenderViaChannelSuiteEntries(in_data, out_data, entries,
@@ -1076,7 +1539,7 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
     PF_Err err = RenderExrLayer(path, layer, black, white, unmult,
                                 output, fmt, place, timings, &decoder_err);
     if (decoder_err.empty()) {
-        if (path_kind_out) *path_kind_out = "file";
+        if (path_kind_out) *path_kind_out = (timings && timings->cached) ? "file-cache" : "file";
         if (layer_out) *layer_out = layer;
         return err;
     }
@@ -1355,7 +1818,9 @@ PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
     // channel suite path; ordering doesn't matter there.)
     std::string path = GetSourceExrPath(in_data, nullptr);
     std::vector<std::string> display_names;
-    if (!path.empty()) display_names = EnumerateExrLayers(path);
+    // Metadata layers = the file's channel prefixes in authoring order, plus
+    // virtual UV layers (e.g. "UV" from UV_U/UV_V/UV_A) placed before <P>_U.
+    if (!path.empty()) display_names = GetExrMetadata(path).layers;
     if (display_names.empty()) return PF_Err_NONE;
 
     int picked = ShowLayerPickerDialog(display_names);
