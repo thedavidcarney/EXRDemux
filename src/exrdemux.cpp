@@ -59,6 +59,7 @@
 #include <ImathBox.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -170,8 +171,57 @@ uint32_t HashLayerName(const std::string& s) {
     return h;
 }
 
-// Get the file path of the EXR backing the layer this effect is applied to.
-// Returns empty string on any failure. Writes a human-readable diagnostic
+// Which file of an image sequence backs the frame being rendered (0 for a
+// single still). Layer time is source time unless Time Remap is on, in which
+// case the remap stream holds the source time. Frame rate is the footage's
+// conformed rate, so "Interpret Footage > Assume this frame rate" is honored.
+A_long SourceFrameIndex(AEGP_SuiteHandler& suites, const PF_InData* in_data,
+                        AEGP_LayerH layer, AEGP_ItemH item,
+                        AEGP_FootageH footage) {
+    A_long num_files = 0, files_per_frame = 0;
+    if (suites.FootageSuite5()->AEGP_GetFootageNumFiles(
+            footage, &num_files, &files_per_frame) || num_files <= 1) {
+        return 0;
+    }
+    if (in_data->time_scale == 0) return 0;
+
+    double t = static_cast<double>(in_data->current_time) / in_data->time_scale;
+
+    AEGP_LayerFlags flags = 0;
+    if (!suites.LayerSuite7()->AEGP_GetLayerFlags(layer, &flags) &&
+        (flags & AEGP_LayerFlag_TIME_REMAPPING)) {
+        A_Time now = { in_data->current_time,
+                       static_cast<A_u_long>(in_data->time_scale) };
+        AEGP_StreamVal2 val;
+        AEGP_StreamType type = AEGP_StreamType_NO_DATA;
+        if (!suites.StreamSuite6()->AEGP_GetLayerStreamValue(
+                layer, AEGP_LayerStream_TIME_REMAP, AEGP_LTimeMode_LayerTime,
+                &now, FALSE, &val, &type) && type == AEGP_StreamType_OneD) {
+            t = val.one_d;
+        }
+    }
+
+    AEGP_FootageInterp interp;
+    std::memset(&interp, 0, sizeof(interp));
+    double fps = 0.0;
+    if (!suites.FootageSuite5()->AEGP_GetFootageInterpretation(item, FALSE, &interp)) {
+        fps = interp.conform_fpsF > 0.0 ? interp.conform_fpsF : interp.native_fpsF;
+    }
+    if (fps <= 0.0) return 0;
+
+    // Epsilon: 1/24 s etc. aren't exact in binary; don't land a frame early.
+    A_long frame = static_cast<A_long>(std::floor(t * fps + 1e-4));
+    if (interp.loop.loops > 1) {
+        frame %= num_files;
+        if (frame < 0) frame += num_files;
+    }
+    if (frame < 0) frame = 0;
+    if (frame >= num_files) frame = num_files - 1;
+    return frame;
+}
+
+// Get the file path of the EXR backing the layer this effect is applied to,
+// at the frame being rendered. Returns empty string on any failure. Writes a human-readable diagnostic
 // describing which step failed to *diag_out (so the popup can surface it
 // during early development).
 std::string GetSourceExrPath(PF_InData* in_data, std::string* diag_out) {
@@ -202,9 +252,11 @@ std::string GetSourceExrPath(PF_InData* in_data, std::string* diag_out) {
     if (err)      return fail("AEGP_GetMainFootageFromItem error");
     if (!footage) return fail("AEGP_GetMainFootageFromItem null");
 
+    A_long frame = SourceFrameIndex(suites, in_data, layer, item, footage);
+
     AEGP_MemHandle path_handle = nullptr;
     err = suites.FootageSuite5()->AEGP_GetFootagePath(
-        footage, 0, AEGP_FOOTAGE_MAIN_FILE_INDEX, &path_handle);
+        footage, frame, AEGP_FOOTAGE_MAIN_FILE_INDEX, &path_handle);
     if (err)          return fail("AEGP_GetFootagePath error");
     if (!path_handle) return fail("AEGP_GetFootagePath null");
 
@@ -330,11 +382,15 @@ std::string DisplayNameFromArgbChannel(const std::string& ae_name) {
     if (last_dot == std::string::npos) return ae_name;
     std::string prefix = ae_name.substr(0, last_dot);
 
-    size_t mid_dot = prefix.find_last_of('.');
-    if (mid_dot != std::string::npos) {
-        std::string left  = prefix.substr(0, mid_dot);
-        std::string right = prefix.substr(mid_dot + 1);
-        if (left == right) return left;
+    // AE doubles the name as "<part>.<layer>". With dotted multipart names
+    // (Blender 5.2: "Environment.CryptoAsset00.Environment.CryptoAsset00")
+    // the halves contain dots themselves, so split at the exact middle.
+    if (prefix.size() % 2 == 1) {
+        size_t mid = prefix.size() / 2;
+        if (prefix[mid] == '.' &&
+            prefix.compare(0, mid, prefix, mid + 1, mid) == 0) {
+            return prefix.substr(0, mid);
+        }
     }
     return prefix;
 }
@@ -588,12 +644,47 @@ void FillBlack(PF_EffectWorld* out, PF_PixelFormat fmt) {
     }
 }
 
+// Where the output buffer sits on the layer. Smart Render hands us a buffer
+// covering only the requested rect (often just the part visible in the comp),
+// whose pixel (0,0) is layer pixel (origin_x, origin_y) in downsampled layer
+// space. Ignoring this pins the image to the comp instead of the layer.
+struct OutputPlacement {
+    A_long origin_x = 0, origin_y = 0;   // buffer origin, downsampled layer px
+    double scale_x = 1.0, scale_y = 1.0; // downsampled layer px -> full-res px
+};
+
+OutputPlacement PlacementFor(const PF_InData* in_data,
+                             const PF_EffectWorld* output, bool smart) {
+    OutputPlacement p;
+    if (smart && output) { p.origin_x = output->origin_x; p.origin_y = output->origin_y; }
+    const PF_RationalScale& dx = in_data->downsample_x;
+    const PF_RationalScale& dy = in_data->downsample_y;
+    if (dx.num > 0 && dx.den > 0) p.scale_x = static_cast<double>(dx.den) / dx.num;
+    if (dy.num > 0 && dy.den > 0) p.scale_y = static_cast<double>(dy.den) / dy.num;
+    return p;
+}
+
+// Source pixel index for each output column / row (-1 = outside source).
+// `offset` shifts layer px into source-buffer px (EXR data window vs
+// display window). Nearest sampling; built once per render so the per-pixel
+// loop stays a table lookup.
+std::vector<int> SourceIndexMap(A_long out_n, A_long origin, double scale,
+                                int offset, int src_n) {
+    std::vector<int> map(static_cast<size_t>(out_n > 0 ? out_n : 0));
+    for (A_long i = 0; i < out_n; ++i) {
+        int s = static_cast<int>(std::floor((i + origin) * scale)) - offset;
+        map[i] = (s >= 0 && s < src_n) ? s : -1;
+    }
+    return map;
+}
+
 // Per-call timings (microseconds) so we can find perf hot spots from the
 // log without an external profiler.
 struct RenderTimings {
     long long open_us = 0;
     long long read_us = 0;
     long long convert_us = 0;
+    long src_w = 0, src_h = 0;   // source pixels we sampled from
 };
 
 // Core EXR-to-output render. Reads the (resolved) layer's R/G/B/A
@@ -604,6 +695,7 @@ PF_Err RenderExrLayer(const std::string& path,
                       double black, double white, bool unmult,
                       PF_EffectWorld* output,
                       PF_PixelFormat fmt,
+                      const OutputPlacement& place,
                       RenderTimings* timings = nullptr,
                       std::string* decoder_error_out = nullptr) {
     if (!output || !output->data) return PF_Err_NONE;
@@ -631,6 +723,7 @@ PF_Err RenderExrLayer(const std::string& path,
         int w = dw.max.x - dw.min.x + 1;
         int h = dw.max.y - dw.min.y + 1;
         if (w <= 0 || h <= 0) { FillBlack(output, fmt); return PF_Err_NONE; }
+        if (timings) { timings->src_w = w; timings->src_h = h; }
 
         // Allocate half buffers for the four channels (default A=1.0).
         std::vector<half> rBuf(static_cast<size_t>(w) * h, half(0.0f));
@@ -656,21 +749,25 @@ PF_Err RenderExrLayer(const std::string& path,
         input.readPixels(dw.min.y, dw.max.y);
         auto t_read = clock::now();
 
-        // Write to output. We assume 1:1 pixel mapping with the EXR's
-        // data window — if AE's output is larger we leave the rest
-        // black, smaller we crop. Phase 4.x will handle resampling.
+        // Write to output. Layer pixel (0,0) is the display window's
+        // corner; the data window may be offset from it.
         A_long out_w = output->width;
         A_long out_h = output->height;
+        Imath::Box2i disp = header.displayWindow();
+        std::vector<int> col = SourceIndexMap(out_w, place.origin_x, place.scale_x,
+                                              dw.min.x - disp.min.x, w);
+        std::vector<int> rowmap = SourceIndexMap(out_h, place.origin_y, place.scale_y,
+                                                 dw.min.y - disp.min.y, h);
 
         for (A_long y = 0; y < out_h; ++y) {
             char* row = reinterpret_cast<char*>(output->data) + y * output->rowbytes;
-            int src_y = y;
-            bool y_in_range = (src_y >= 0 && src_y < h);
+            int src_y = rowmap[y];
+            bool y_in_range = (src_y >= 0);
 
             for (A_long x = 0; x < out_w; ++x) {
-                int src_x = x;
+                int src_x = col[x];
                 float fr = 0, fg = 0, fb_ = 0, fa = 0;
-                if (y_in_range && src_x >= 0 && src_x < w) {
+                if (y_in_range && src_x >= 0) {
                     size_t i = static_cast<size_t>(src_y) * w + src_x;
                     fr  = static_cast<float>(rBuf[i]);
                     fg  = static_cast<float>(gBuf[i]);
@@ -766,6 +863,7 @@ PF_Err RenderViaChannelSuiteEntries(
         const std::vector<ChannelEntry>& entries,
         uint32_t hash, double black, double white, bool unmult,
         PF_EffectWorld* output, PF_PixelFormat fmt,
+        const OutputPlacement& place,
         RenderTimings* timings = nullptr) {
     if (!output || !output->data) return PF_Err_NONE;
     if (timings) *timings = RenderTimings{};
@@ -813,21 +911,28 @@ PF_Err RenderViaChannelSuiteEntries(
     A_long out_h = output->height;
     A_long src_w = chunk.widthL;
     A_long src_h = chunk.heightL;
+    if (timings) { timings->src_w = src_w; timings->src_h = src_h; }
+
+    // AE delivers the chunk already at the current downsample (3850x720 for
+    // a 7700x1440 layer at Half), so buffer px map 1:1 after the origin
+    // shift — no scale here, unlike the full-res file-direct path.
+    std::vector<int> col = SourceIndexMap(out_w, place.origin_x, 1.0, 0, src_w);
+    std::vector<int> rowmap = SourceIndexMap(out_h, place.origin_y, 1.0, 0, src_h);
 
     // For 32bpc + identity adjust + unmult-off, we could memcpy each row.
     // Keep the unified per-pixel loop for now — Phase 4.x can fast-path.
     for (A_long y = 0; y < out_h; ++y) {
         char* row = reinterpret_cast<char*>(output->data) + y * output->rowbytes;
-        bool y_in_range = (y >= 0 && y < src_h);
-        const float* src_row = y_in_range
+        int src_y = rowmap[y];
+        const float* src_row = (src_y >= 0)
             ? reinterpret_cast<const float*>(
-                  reinterpret_cast<const char*>(chunk.dataPV) + y * chunk.row_bytesL)
+                  reinterpret_cast<const char*>(chunk.dataPV) + src_y * chunk.row_bytesL)
             : nullptr;
 
         for (A_long x = 0; x < out_w; ++x) {
             float fa = 0, fr = 0, fg = 0, fb_ = 0;
-            if (src_row && x >= 0 && x < src_w) {
-                const float* p = src_row + x * 4;
+            if (src_row && col[x] >= 0) {
+                const float* p = src_row + col[x] * 4;
                 fa  = p[0]; fr  = p[1]; fg  = p[2]; fb_ = p[3];
                 ApplyAdjust(fr, fg, fb_, fa, black, white, unmult);
             }
@@ -893,6 +998,7 @@ void LogEvent(const std::string& message);
 PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
                   uint32_t hash, double black, double white, bool unmult,
                   PF_EffectWorld* output, PF_PixelFormat fmt,
+                  const OutputPlacement& place,
                   RenderTimings* timings,
                   const char** path_kind_out,
                   std::string* layer_out) {
@@ -911,7 +1017,14 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
 
     bool fresh = !path.empty() && ChannelSuiteMatchesFile(entries, meta);
 
-    if (fresh) {
+    // AE only exposes layers that have an alpha channel. RGB-only passes
+    // (Blender 5.2 multipart light groups) exist only on the file side.
+    bool in_suite = false;
+    for (const auto& e : entries) {
+        if (HashLayerName(e.display_name) == hash) { in_suite = true; break; }
+    }
+
+    if (fresh && in_suite) {
         if (path_kind_out) *path_kind_out = "suite";
         if (layer_out) {
             for (const auto& e : entries) {
@@ -922,14 +1035,14 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
         }
         return RenderViaChannelSuiteEntries(in_data, out_data, entries,
                                             hash, black, white, unmult,
-                                            output, fmt, timings);
+                                            output, fmt, place, timings);
     }
 
     // Mismatch between AE's surface and the EXR on disk — emit a one-time
     // diagnostic so we can see exactly what AE exposes for files where the
     // strict equality check trips. Limit volume by listing names only and
     // truncating the lists.
-    if (!path.empty()) {
+    if (!path.empty() && !fresh) {
         std::string msg = "Staleness-mismatch  path=" + path;
         msg += "\n  suite[" + std::to_string(entries.size()) + "]:";
         size_t n = 0;
@@ -961,7 +1074,7 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
     std::string layer = ResolveLayerByHash(meta, hash);
     std::string decoder_err;
     PF_Err err = RenderExrLayer(path, layer, black, white, unmult,
-                                output, fmt, timings, &decoder_err);
+                                output, fmt, place, timings, &decoder_err);
     if (decoder_err.empty()) {
         if (path_kind_out) *path_kind_out = "file";
         if (layer_out) *layer_out = layer;
@@ -981,7 +1094,7 @@ PF_Err RenderHash(PF_InData* in_data, PF_OutData* out_data,
     }
     return RenderViaChannelSuiteEntries(in_data, out_data, entries,
                                         hash, black, white, unmult,
-                                        output, fmt, timings);
+                                        output, fmt, place, timings);
 }
 
 // Path to the user's Desktop, where we drop the diagnostic perf log.
@@ -1006,7 +1119,9 @@ std::string DesktopFilePath(const char* filename) {
 // case.
 void LogPerf(const char* selector, long long total_us,
              const RenderTimings& t, const std::string& path,
-             const std::string& layer) {
+             const std::string& layer,
+             const PF_EffectWorld* out = nullptr,
+             const OutputPlacement* place = nullptr) {
     const char* opt_in = std::getenv("EXRDEMUX_PERF_LOG");
     if (!opt_in || opt_in[0] == '\0') return;
 
@@ -1014,8 +1129,13 @@ void LogPerf(const char* selector, long long total_us,
     if (log_path.empty()) return;
     if (FILE* f = std::fopen(log_path.c_str(), "ab")) {
         std::fprintf(f,
-            "%s total=%lldus open=%lldus read=%lldus convert=%lldus  layer=%s  path=%s\n",
+            "%s total=%lldus open=%lldus read=%lldus convert=%lldus"
+            "  src=%ldx%ld buf=%ldx%ld@%ld,%ld ds=%.3gx%.3g  layer=%s  path=%s\n",
             selector, total_us, t.open_us, t.read_us, t.convert_us,
+            t.src_w, t.src_h,
+            out ? (long)out->width : 0L, out ? (long)out->height : 0L,
+            place ? (long)place->origin_x : 0L, place ? (long)place->origin_y : 0L,
+            place ? place->scale_x : 1.0, place ? place->scale_y : 1.0,
             layer.empty() ? "<none>" : layer.c_str(),
             path.empty() ? "<none>" : path.c_str());
         std::fclose(f);
@@ -1200,18 +1320,20 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data,
     bool unmult   = params[PARAM_UNMULT]->u.bd.value != 0;
 
     PF_PixelFormat fmt = GetOutputPixelFormat(in_data, out_data, output);
+    OutputPlacement place = PlacementFor(in_data, output, false);
     RenderTimings rt;
     const char* path_kind = "?";
     std::string layer_used;
     PF_Err err = RenderHash(in_data, out_data, hash,
                             black, white, unmult, output, fmt,
+                            place,
                             &rt, &path_kind, &layer_used);
 
     auto total = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now() - t_start).count();
     char selector[32];
     std::snprintf(selector, sizeof(selector), "Render(%s)", path_kind);
-    LogPerf(selector, total, rt, path_kind, layer_used);
+    LogPerf(selector, total, rt, path_kind, layer_used, output, &place);
     return err;
 }
 
@@ -1402,19 +1524,21 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data,
                   |  (static_cast<uint32_t>(lo_d) & 0xFFFFu);
 
     PF_PixelFormat fmt = GetOutputPixelFormat(in_data, out_data, output_worldP);
+    OutputPlacement place = PlacementFor(in_data, output_worldP, true);
     RenderTimings rt;
     const char* path_kind = "?";
     std::string layer_used;
     PF_Err render_err = RenderHash(in_data, out_data, hash,
                                    black, white, unmult,
                                    output_worldP, fmt,
+                                   place,
                                    &rt, &path_kind, &layer_used);
 
     auto total = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now() - t_start).count();
     char selector[32];
     std::snprintf(selector, sizeof(selector), "SmartRender(%s)", path_kind);
-    LogPerf(selector, total, rt, path_kind, layer_used);
+    LogPerf(selector, total, rt, path_kind, layer_used, output_worldP, &place);
     return render_err;
 }
 

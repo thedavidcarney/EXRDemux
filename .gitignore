@@ -45,6 +45,9 @@ DerivedData/
 *.idb
 *.ilk
 
+# --- Local test projects (client material, never commit) ---
+tests/
+
 # --- Misc ---
 *.log
 Thumbs.db

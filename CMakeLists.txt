@@ -181,6 +181,21 @@ elseif(APPLE)
         MACOSX_PACKAGE_LOCATION "Resources"
         GENERATED TRUE)
     target_sources(EXRDemux PRIVATE "${PIPL_RSRC}")
+
+    # Ad-hoc re-sign the *assembled* bundle as the last step. The arm64
+    # linker only ad-hoc-signs the Mach-O; the Rez .rsrc is copied into
+    # Contents/Resources afterward, which invalidates any prior bundle
+    # seal ("code has no resources but signature indicates they must be
+    # present"). A locally built, non-quarantined bundle still loads, so
+    # this stays invisible until a downloaded (quarantined) copy hits a
+    # strict Gatekeeper on Apple Silicon and AE reports "couldn't find
+    # main entry point". Sealing here, after the .rsrc lands, keeps the
+    # signature valid through the zip→download→unzip path. (Not
+    # notarization — users still need `xattr -dr com.apple.quarantine`.)
+    add_custom_command(TARGET EXRDemux POST_BUILD
+        COMMAND codesign --force --deep --sign - "$<TARGET_BUNDLE_DIR:EXRDemux>"
+        COMMENT "Ad-hoc signing the assembled .plugin bundle"
+        VERBATIM)
 endif()
 
 # Quiet a few MSVC warnings the SDK headers trip but we can't fix.

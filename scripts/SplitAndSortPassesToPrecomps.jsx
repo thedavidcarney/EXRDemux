@@ -139,11 +139,13 @@
         }
     }
 
-    // From raw channel names, derive the user-facing layer display names that
-    // the plugin uses (and hashes). Mirrors the plugin's logic:
-    //   - everything before the last '.'  is the "layer key"
-    //   - if the layer key has the form "X.X", collapse to "X"
+    // From raw channel names, derive the layer names the plugin uses (and
+    // hashes). Mirrors EnumerateExrLayers() in src/exrdemux.cpp:
+    //   - everything before the last '.' is the layer name, kept as is
+    //     (no "X.X" collapse; that only applies to AE's channel-suite names)
     //   - bare channels (no dot) collapse into a single "(default)" entry
+    // Names stay as raw UTF-8 byte strings so fnv1a32() hashes the same
+    // bytes the plugin does; use utf8Decode() for anything shown to the user.
     function extractDisplayNames(channels) {
         var seenKeys = {};
         var keys = [];
@@ -160,17 +162,13 @@
         }
         var displays = [];
         if (hasDefault) displays.push("(default)");
-        for (var j = 0; j < keys.length; j++) {
-            var k = keys[j];
-            var mid = k.lastIndexOf(".");
-            if (mid >= 0) {
-                var left = k.substring(0, mid);
-                var right = k.substring(mid + 1);
-                if (left === right) { displays.push(left); continue; }
-            }
-            displays.push(k);
-        }
+        for (var j = 0; j < keys.length; j++) displays.push(keys[j]);
         return displays;
+    }
+
+    // EXR names are UTF-8 bytes; the header reader gives one char per byte.
+    function utf8Decode(bytes) {
+        try { return decodeURIComponent(escape(bytes)); } catch (_) { return bytes; }
     }
 
     // ---- Color-grouping by shared prefix --------------------------------
@@ -333,7 +331,8 @@
         var precompsByDisplay = [];
 
         for (var i = 0; i < displays.length; i++) {
-            var displayName = displays[i];
+            var rawName = displays[i];
+            var displayName = utf8Decode(rawName);
             var precomp = proj.items.addComp(
                 displayName, width, height, par, compDuration, fps);
             precomp.parentFolder = precompsFolder;
@@ -353,7 +352,7 @@
                     "Could not apply 'tdcarney EXRDemux' effect. Is the plugin installed?");
             }
 
-            var hash = fnv1a32(displayName);
+            var hash = fnv1a32(rawName);
             var hi = (hash >>> 16) & 0xFFFF;
             var lo = hash & 0xFFFF;
             fx.property("Layer Hash Hi").setValue(hi);
