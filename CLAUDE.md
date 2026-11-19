@@ -46,13 +46,24 @@ together in a single commit before tagging:
    to load the plugin with a version-mismatch error.
 4. **README.md** — if test status changed, update the "Things I didn't
    test very much" list.
-5. **Build artifacts** — rebuild Win Release `.aex` + Mac Release
-   `.plugin`, zip both with `THIRD_PARTY_LICENSES.txt`, stage in
-   `release/EXRDemux-vX.Y.Z-{win-x64,mac-arm64}.zip`.
-6. **Git tag** — `vX.Y.Z` matching `EXRDEMUX_VERSION_STRING`.
-7. **GitHub Release** — created via the web UI (we don't have `gh`
-   wired up yet); attach both zips, paste release notes from the
-   commits since the last tag.
+5. **Build + package** — rebuild Win Release `.aex` and Mac Release
+   `.plugin`, then run `python scripts/package_iftk.py` on each machine.
+   It writes `release/iftk/EXRDemux-X.Y.Z-{win,mac}.zip` in IFTK's
+   layout (`plugins/` + `support/THIRD_PARTY_LICENSES.txt`, no scripts).
+   Copy the Mac zip back to Windows.
+6. **Test the Mac build in AE** — automatically, no hand testing (local
+   harness in `tests/iftk_neutral/mac_test/`, gitignored).
+7. **Git tag** — `vX.Y.Z` matching `EXRDEMUX_VERSION_STRING`.
+8. **GitHub Release** — `gh release create vX.Y.Z` with both zips and
+   notes from the commits since the last tag.
+9. **IFTK** — from the `noschmo-catalog` checkout:
+   `python scripts/publish.py release exrdemux --version X.Y.Z --mac <mac zip> --win <win zip> --notes "..."`.
+   It uploads to the catalog's own release and pushes `catalog.json`
+   (David OK'd this for his own plugins). Check the two sha256 values
+   in `tools/exrdemux.json` match the local zips. Never change the
+   catalog id `exrdemux`. To update the guide or preview, edit
+   `notes/iftk/` here, then copy into the catalog's `guides/` /
+   `publish.py set exrdemux --thumb`.
 
 After publishing the release, immediately bump `EXRDEMUX_VERSION_STRING`
 to the next planned version (e.g. `v0.2.4`) so the in-development
@@ -72,9 +83,14 @@ binary doesn't masquerade as the released one.
 - **The repo is public.** No SSH endpoints, no usernames, no internal
   file paths in commits, comments, or release notes. (Dev creds /
   endpoints live in Claude's local memory, not in the repo.)
-- **No notarization yet.** Mac builds are ad-hoc signed; users need
-  `xattr -dr com.apple.quarantine ...` after download. README has the
-  command. When notarization is set up, replace this section.
+- **No notarization yet.** Mac builds are ad-hoc signed. IFTK clears
+  `com.apple.quarantine` itself; only hand installs need the `xattr`
+  command in the README. The bundle must pass
+  `codesign -v --strict --deep` (the post-build re-sign takes care of
+  it). When notarization is set up, replace this section.
+- **One copy only.** IFTK installs to `MediaCore\NoSchmo` (Win) and
+  `<AE>/Plug-ins/NoSchmo` (Mac). Dev builds go there via
+  `--target deploy`, never into another Plug-ins folder.
 
 ## Where to look
 

@@ -32,9 +32,15 @@ Any testing helps — AE 2026 feedback especially. Feedback or wishlists welcome
 
 ## Install
 
-**Windows:** drop `EXRDemux.aex` into `C:\Program Files\Adobe\Adobe After Effects <version>\Support Files\Plug-ins\` (e.g. `Adobe After Effects 2026`) and restart AE.
+**Install it from IFTK**, the team's tool manager (Full Releases > EXRDemux). IFTK installs, updates and uninstalls it on Windows and Mac, and clears the Mac quarantine flag itself.
 
-**macOS:** drop `EXRDemux.plugin` into `/Applications/Adobe After Effects <version>/Plug-ins/` (e.g. `Adobe After Effects 2026`) and restart AE. The bundle is ad-hoc signed; if Gatekeeper blocks it, run `xattr -dr com.apple.quarantine "/Applications/Adobe After Effects <version>/Plug-ins/EXRDemux.plugin"`.
+If you need to install by hand, use the same folders IFTK uses, so IFTK can find and replace the copy later. Don't put it anywhere else: two copies make AE load the effect twice.
+
+**Windows:** `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\NoSchmo\EXRDemux.aex`, then restart AE.
+
+**macOS:** `/Applications/Adobe After Effects <version>/Plug-ins/NoSchmo/EXRDemux.plugin`, then restart AE. The bundle is ad-hoc signed; if Gatekeeper blocks it, run `xattr -dr com.apple.quarantine "/Applications/Adobe After Effects <version>/Plug-ins/NoSchmo/EXRDemux.plugin"`.
+
+Older instructions put it in `Support Files\Plug-ins\` (Windows) or `Plug-ins/` (Mac). IFTK will remove those copies once it supports them; until then, don't install from IFTK on a machine that has one.
 
 Effect appears under **Effect → EXR → EXRDemux**.
 
