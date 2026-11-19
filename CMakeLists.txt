@@ -199,6 +199,37 @@ elseif(APPLE)
         VERBATIM)
 endif()
 
+# ----- Dev deploy (opt-in: `cmake --build --preset <p> --target deploy`) -----
+# Copies the build over the copy the team tool manager (IFTK) installs, so AE
+# only ever sees one EXRDemux. Don't deploy anywhere else: a second copy with
+# the same match name makes AE load two plugins. Windows default is IFTK's
+# shared MediaCore folder (every AE version loads it); on Mac IFTK installs per
+# AE version, so set EXRDEMUX_DEPLOY_DIR to "<AE>/Plug-ins/NoSchmo".
+if(WIN32)
+    set(_deploy_default "$ENV{ProgramFiles}/Adobe/Common/Plug-ins/7.0/MediaCore/NoSchmo")
+else()
+    set(_deploy_default "")
+endif()
+set(EXRDEMUX_DEPLOY_DIR "${_deploy_default}" CACHE PATH
+    "Folder the deploy target copies the plugin into (IFTK's install folder)")
+if(EXRDEMUX_DEPLOY_DIR)
+    if(APPLE)
+        add_custom_target(deploy
+            COMMAND rm -rf "${EXRDEMUX_DEPLOY_DIR}/EXRDemux.plugin"
+            COMMAND ditto "$<TARGET_BUNDLE_DIR:EXRDemux>" "${EXRDEMUX_DEPLOY_DIR}/EXRDemux.plugin"
+            DEPENDS EXRDemux
+            COMMENT "Deploying EXRDemux.plugin to ${EXRDEMUX_DEPLOY_DIR}"
+            VERBATIM)
+    else()
+        add_custom_target(deploy
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${EXRDEMUX_DEPLOY_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:EXRDemux>" "${EXRDEMUX_DEPLOY_DIR}/EXRDemux.aex"
+            DEPENDS EXRDemux
+            COMMENT "Deploying EXRDemux.aex to ${EXRDEMUX_DEPLOY_DIR}"
+            VERBATIM)
+    endif()
+endif()
+
 # ----- Pass-cache bench (optional, no AE needed) -----
 # Exercises src/exrdemux_pass_cache.cpp against a real multipart EXR:
 # shared decode, multithreaded hits, and in-place re-render detection.
