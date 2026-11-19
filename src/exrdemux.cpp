@@ -90,7 +90,7 @@
 // of the Effect Controls panel. MUST be bumped on every release. See
 // CLAUDE.md "Release checklist" — this and the version macros above plus
 // AE_Effect_Version in exrdemux.r move together.
-#define EXRDEMUX_VERSION_STRING "v0.9.1"
+#define EXRDEMUX_VERSION_STRING "v0.9.2"
 
 namespace {
 
